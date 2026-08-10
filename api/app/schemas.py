@@ -29,3 +29,25 @@ class PriceSnapshotRead(BaseModel):
     in_stock: bool
     scraped_at: datetime
     raw_title: str | None
+
+
+class LatestPrice(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    price: Decimal
+    currency: str
+    in_stock: bool
+    scraped_at: datetime
+
+
+class ProductWithLatestPrice(ProductRead):
+    latest_price: LatestPrice | None = None
+
+
+class ScrapeQueuedResponse(BaseModel):
+    queued: bool
+    queue_depth: int
+
+
+class QueueDepthResponse(BaseModel):
+    depth: int

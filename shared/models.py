@@ -4,7 +4,7 @@ from sqlalchemy import Boolean, DateTime, ForeignKey, Index, Numeric, String, fu
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from sqlalchemy.sql import desc
 
-from app.database import Base
+from shared.database import Base
 
 
 class Product(Base):
