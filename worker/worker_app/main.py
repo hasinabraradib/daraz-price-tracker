@@ -5,6 +5,7 @@ import sys
 import time
 from datetime import datetime, timezone
 
+from shared.alerts import evaluate_alerts
 from shared.config import settings
 from shared.database import async_session_factory
 from shared.models import PriceSnapshot, ScrapeAttempt
@@ -81,6 +82,9 @@ async def _handle_success(job: dict, result: ScrapedProduct, started: float) -> 
         )
         await session.commit()
 
+    async with async_session_factory() as alert_session:
+        alert_events = await evaluate_alerts(alert_session, product_id)
+
     log_event(
         job_id=job_id,
         product_id=product_id,
@@ -90,6 +94,7 @@ async def _handle_success(job: dict, result: ScrapedProduct, started: float) -> 
         in_stock=result.in_stock,
         duration_ms=duration_ms,
         attempt_number=attempt_number,
+        alert_events=len(alert_events),
     )
 
 

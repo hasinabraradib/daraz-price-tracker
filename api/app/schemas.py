@@ -1,7 +1,8 @@
 from datetime import datetime
 from decimal import Decimal
+from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, HttpUrl
+from pydantic import BaseModel, ConfigDict, HttpUrl, model_validator
 
 
 class ProductCreate(BaseModel):
@@ -100,3 +101,97 @@ class ScrapeHealthStats(BaseModel):
     queue_depth: int
     delayed_queue_depth: int
     dead_letter_depth: int
+
+
+# ---- competitors ----
+
+
+class CompetitorLinkCreate(BaseModel):
+    competitor_product_id: int
+
+
+class CompetitorRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    product_id: int
+    competitor_product_id: int
+    created_at: datetime
+
+
+class CompetitorWithPrice(BaseModel):
+    id: int
+    competitor_product_id: int
+    competitor_name: str
+    competitor_daraz_url: str
+    latest_price: Decimal | None = None
+    currency: str | None = None
+    # gap = this product's price - competitor's price; positive means
+    # we're more expensive (the undercut direction)
+    gap: Decimal | None = None
+    gap_pct: float | None = None
+    created_at: datetime
+
+
+class ComparisonEntry(BaseModel):
+    product_id: int
+    name: str
+    daraz_url: str
+    latest_price: Decimal | None = None
+    currency: str | None = None
+    in_stock: bool | None = None
+    is_cheapest: bool
+    is_self: bool
+
+
+class ComparisonResponse(BaseModel):
+    product_id: int
+    entries: list[ComparisonEntry]
+
+
+# ---- alert rules & events ----
+
+
+class AlertRuleCreate(BaseModel):
+    rule_type: Literal["undercut", "price_below", "back_in_stock"]
+    threshold_price: Decimal | None = None
+    channel: Literal["email", "webhook"]
+    destination: str
+
+    @model_validator(mode="after")
+    def _validate(self) -> "AlertRuleCreate":
+        if self.rule_type == "price_below" and self.threshold_price is None:
+            raise ValueError("threshold_price is required for price_below rules")
+        if self.channel == "webhook" and not self.destination.startswith(("http://", "https://")):
+            raise ValueError("webhook destination must be an http(s) URL")
+        if self.channel == "email" and "@" not in self.destination:
+            raise ValueError("email destination must be a valid email address")
+        return self
+
+
+class AlertRuleRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    product_id: int
+    rule_type: str
+    threshold_price: Decimal | None
+    channel: str
+    destination: str
+    is_active: bool
+    created_at: datetime
+
+
+class AlertEventRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    alert_rule_id: int
+    triggered_at: datetime
+    resolved_at: datetime | None
+    trigger_price: Decimal | None
+    competitor_price: Decimal | None
+    competitor_product_id: int | None
+    message: str
+    delivery_status: str
+    delivery_error: str | None

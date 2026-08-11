@@ -1,11 +1,19 @@
 """API tests. The scraper (Playwright/network) is never invoked here — API
 endpoints only enqueue jobs onto (fake) Redis; actual scraping happens in
 the worker process, which these tests don't exercise at all."""
+from datetime import datetime, timezone
 from decimal import Decimal
 
 import pytest
 
-from shared.models import PriceSnapshot, Product, ScrapeAttempt
+from shared.models import (
+    AlertEvent,
+    AlertRule,
+    PriceSnapshot,
+    Product,
+    ProductCompetitor,
+    ScrapeAttempt,
+)
 from shared.queue import dead_letter
 
 
@@ -288,3 +296,244 @@ async def test_discard_dead_letter_via_api(client, fake_redis):
 
     missing_response = await client.delete("/dead-letters/api-dlq-discard")
     assert missing_response.status_code == 404
+
+
+# ---- competitors ----
+
+
+async def _seed_two_products(db_session, suffix: str = ""):
+    mine = Product(name=f"Mine{suffix}", daraz_url=f"https://www.daraz.pk/mine{suffix}-i1-s1.html")
+    theirs = Product(
+        name=f"Theirs{suffix}", daraz_url=f"https://www.daraz.pk/theirs{suffix}-i2-s2.html"
+    )
+    db_session.add_all([mine, theirs])
+    await db_session.commit()
+    await db_session.refresh(mine)
+    await db_session.refresh(theirs)
+    return mine, theirs
+
+
+@pytest.mark.asyncio
+async def test_add_competitor(client, db_session):
+    mine, theirs = await _seed_two_products(db_session)
+
+    response = await client.post(
+        f"/products/{mine.id}/competitors", json={"competitor_product_id": theirs.id}
+    )
+    assert response.status_code == 201
+    body = response.json()
+    assert body["product_id"] == mine.id
+    assert body["competitor_product_id"] == theirs.id
+
+
+@pytest.mark.asyncio
+async def test_add_competitor_self_rejected(client, db_session):
+    mine, _ = await _seed_two_products(db_session)
+
+    response = await client.post(
+        f"/products/{mine.id}/competitors", json={"competitor_product_id": mine.id}
+    )
+    assert response.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_add_competitor_duplicate_rejected(client, db_session):
+    mine, theirs = await _seed_two_products(db_session)
+    await client.post(f"/products/{mine.id}/competitors", json={"competitor_product_id": theirs.id})
+
+    response = await client.post(
+        f"/products/{mine.id}/competitors", json={"competitor_product_id": theirs.id}
+    )
+    assert response.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_add_competitor_missing_product_returns_404(client, db_session):
+    mine, _ = await _seed_two_products(db_session)
+
+    response = await client.post(
+        f"/products/{mine.id}/competitors", json={"competitor_product_id": 999999}
+    )
+    assert response.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_list_competitors_includes_price_and_gap(client, db_session):
+    mine, theirs = await _seed_two_products(db_session)
+    db_session.add(ProductCompetitor(product_id=mine.id, competitor_product_id=theirs.id))
+    db_session.add_all(
+        [
+            PriceSnapshot(
+                product_id=mine.id, price=Decimal("100.00"), currency="Rs",
+                in_stock=True, raw_title="Mine",
+            ),
+            PriceSnapshot(
+                product_id=theirs.id, price=Decimal("80.00"), currency="Rs",
+                in_stock=True, raw_title="Theirs",
+            ),
+        ]
+    )
+    await db_session.commit()
+
+    response = await client.get(f"/products/{mine.id}/competitors")
+    assert response.status_code == 200
+    [entry] = response.json()
+    assert entry["competitor_product_id"] == theirs.id
+    assert entry["latest_price"] == "80.00"
+    assert Decimal(entry["gap"]) == Decimal("20.00")
+
+
+@pytest.mark.asyncio
+async def test_remove_competitor(client, db_session):
+    mine, theirs = await _seed_two_products(db_session)
+    await client.post(f"/products/{mine.id}/competitors", json={"competitor_product_id": theirs.id})
+
+    delete_response = await client.delete(f"/products/{mine.id}/competitors/{theirs.id}")
+    assert delete_response.status_code == 204
+
+    list_response = await client.get(f"/products/{mine.id}/competitors")
+    assert list_response.json() == []
+
+    missing_response = await client.delete(f"/products/{mine.id}/competitors/{theirs.id}")
+    assert missing_response.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_comparison_flags_cheapest(client, db_session):
+    mine, theirs = await _seed_two_products(db_session)
+    db_session.add(ProductCompetitor(product_id=mine.id, competitor_product_id=theirs.id))
+    db_session.add_all(
+        [
+            PriceSnapshot(
+                product_id=mine.id, price=Decimal("100.00"), currency="Rs",
+                in_stock=True, raw_title="Mine",
+            ),
+            PriceSnapshot(
+                product_id=theirs.id, price=Decimal("80.00"), currency="Rs",
+                in_stock=True, raw_title="Theirs",
+            ),
+        ]
+    )
+    await db_session.commit()
+
+    response = await client.get(f"/products/{mine.id}/comparison")
+    assert response.status_code == 200
+    body = response.json()
+    by_id = {e["product_id"]: e for e in body["entries"]}
+    assert by_id[mine.id]["is_cheapest"] is False
+    assert by_id[mine.id]["is_self"] is True
+    assert by_id[theirs.id]["is_cheapest"] is True
+    assert by_id[theirs.id]["is_self"] is False
+
+
+# ---- alert rules ----
+
+
+@pytest.mark.asyncio
+async def test_create_alert_rule(client, db_session):
+    mine, _ = await _seed_two_products(db_session)
+
+    response = await client.post(
+        f"/products/{mine.id}/alert-rules",
+        json={"rule_type": "undercut", "channel": "email", "destination": "buyer@example.com"},
+    )
+    assert response.status_code == 201
+    body = response.json()
+    assert body["rule_type"] == "undercut"
+    assert body["is_active"] is True
+
+
+@pytest.mark.asyncio
+async def test_create_price_below_rule_requires_threshold(client, db_session):
+    mine, _ = await _seed_two_products(db_session)
+
+    response = await client.post(
+        f"/products/{mine.id}/alert-rules",
+        json={"rule_type": "price_below", "channel": "email", "destination": "buyer@example.com"},
+    )
+    assert response.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_create_webhook_rule_requires_http_url(client, db_session):
+    mine, _ = await _seed_two_products(db_session)
+
+    response = await client.post(
+        f"/products/{mine.id}/alert-rules",
+        json={"rule_type": "undercut", "channel": "webhook", "destination": "not-a-url"},
+    )
+    assert response.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_list_and_delete_alert_rule(client, db_session):
+    mine, _ = await _seed_two_products(db_session)
+    create_response = await client.post(
+        f"/products/{mine.id}/alert-rules",
+        json={"rule_type": "undercut", "channel": "email", "destination": "buyer@example.com"},
+    )
+    rule_id = create_response.json()["id"]
+
+    list_response = await client.get(f"/products/{mine.id}/alert-rules")
+    assert len(list_response.json()) == 1
+
+    delete_response = await client.delete(f"/products/{mine.id}/alert-rules/{rule_id}")
+    assert delete_response.status_code == 204
+
+    missing_response = await client.delete(f"/products/{mine.id}/alert-rules/{rule_id}")
+    assert missing_response.status_code == 404
+
+
+# ---- alerts ----
+
+
+@pytest.mark.asyncio
+async def test_list_alerts_filters_by_product_and_status(client, db_session):
+    mine, _ = await _seed_two_products(db_session)
+    other, _ = await _seed_two_products(db_session, suffix="2")  # unrelated product's rule
+
+    rule_for_mine = AlertRule(
+        product_id=mine.id, rule_type="undercut", channel="email", destination="a@example.com"
+    )
+    rule_for_other = AlertRule(
+        product_id=other.id, rule_type="undercut", channel="email", destination="b@example.com"
+    )
+    db_session.add_all([rule_for_mine, rule_for_other])
+    await db_session.commit()
+    await db_session.refresh(rule_for_mine)
+    await db_session.refresh(rule_for_other)
+
+    db_session.add_all(
+        [
+            AlertEvent(
+                alert_rule_id=rule_for_mine.id, resolved_at=None, trigger_price=Decimal("90"),
+                message="open for mine",
+            ),
+            AlertEvent(
+                alert_rule_id=rule_for_mine.id,
+                resolved_at=datetime.now(timezone.utc),
+                trigger_price=Decimal("90"),
+                message="resolved for mine",
+            ),
+            AlertEvent(
+                alert_rule_id=rule_for_other.id, resolved_at=None, trigger_price=Decimal("90"),
+                message="for other product",
+            ),
+        ]
+    )
+    await db_session.commit()
+
+    all_response = await client.get("/alerts")
+    assert len(all_response.json()) == 3
+
+    mine_response = await client.get(f"/alerts?product_id={mine.id}")
+    assert len(mine_response.json()) == 2
+    assert all(e["message"] != "for other product" for e in mine_response.json())
+
+    open_response = await client.get("/alerts?status=open")
+    assert len(open_response.json()) == 2
+    assert all(e["resolved_at"] is None for e in open_response.json())
+
+    resolved_response = await client.get("/alerts?status=resolved")
+    assert len(resolved_response.json()) == 1
+    assert resolved_response.json()[0]["message"] == "resolved for mine"

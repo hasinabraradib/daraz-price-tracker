@@ -1,18 +1,6 @@
-import random
-
-from shared.config import settings
-
-
-def compute_backoff_delay(attempt_number: int) -> float:
-    """Full-jitter exponential backoff for the delay before retrying, given
-    that `attempt_number` (1-indexed) just failed.
-
-    computed_delay = min(base * factor^(attempt_number - 1), max_delay)
-    actual_delay   = random.uniform(0, computed_delay)
-    """
-    computed_delay = min(
-        settings.retry_base_delay_seconds
-        * (settings.retry_backoff_factor ** (attempt_number - 1)),
-        settings.retry_max_delay_seconds,
-    )
-    return random.uniform(0, computed_delay)
+# The backoff computation lives in shared/retry.py because shared/notifiers.py
+# (alert email/webhook delivery) needs the same retry math the scraper's
+# retry logic uses — one implementation, not two. This module re-exports it
+# so worker code can `from .retry import compute_backoff_delay` per the
+# project's file layout.
+from shared.retry import compute_backoff_delay  # noqa: F401

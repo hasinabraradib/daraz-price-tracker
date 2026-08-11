@@ -1,6 +1,17 @@
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Index, Integer, Numeric, String, func
+from sqlalchemy import (
+    Boolean,
+    CheckConstraint,
+    DateTime,
+    ForeignKey,
+    Index,
+    Integer,
+    Numeric,
+    String,
+    UniqueConstraint,
+    func,
+)
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from sqlalchemy.sql import desc
 
@@ -75,3 +86,93 @@ class ScrapeAttempt(Base):
     attempt_number: Mapped[int] = mapped_column(Integer, nullable=False)
 
     product: Mapped["Product"] = relationship(back_populates="scrape_attempts")
+
+
+class ProductCompetitor(Base):
+    """'Watch this competitor for this product of mine.' Both columns
+    reference products.id; no ORM relationship() here (queried explicitly
+    via select() like everywhere else in this codebase) since a
+    self-referential FK pair needs relationship(foreign_keys=...)
+    disambiguation for no real benefit at our current scale."""
+
+    __tablename__ = "product_competitors"
+    __table_args__ = (
+        UniqueConstraint(
+            "product_id", "competitor_product_id", name="uq_product_competitor_pair"
+        ),
+        CheckConstraint(
+            "product_id != competitor_product_id", name="ck_product_competitor_not_self"
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    product_id: Mapped[int] = mapped_column(
+        ForeignKey("products.id", ondelete="CASCADE"), nullable=False
+    )
+    competitor_product_id: Mapped[int] = mapped_column(
+        ForeignKey("products.id", ondelete="CASCADE"), nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
+class AlertRule(Base):
+    __tablename__ = "alert_rules"
+    __table_args__ = (
+        CheckConstraint(
+            "rule_type IN ('undercut', 'price_below', 'back_in_stock')",
+            name="ck_alert_rules_rule_type",
+        ),
+        CheckConstraint("channel IN ('email', 'webhook')", name="ck_alert_rules_channel"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    product_id: Mapped[int] = mapped_column(
+        ForeignKey("products.id", ondelete="CASCADE"), nullable=False
+    )
+    rule_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    # only meaningful (and required, enforced at the API layer) for
+    # rule_type="price_below"
+    threshold_price: Mapped[float | None] = mapped_column(Numeric(12, 2), nullable=True)
+    channel: Mapped[str] = mapped_column(String(16), nullable=False)
+    destination: Mapped[str] = mapped_column(String(512), nullable=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
+class AlertEvent(Base):
+    __tablename__ = "alert_events"
+    __table_args__ = (
+        CheckConstraint(
+            "delivery_status IN ('pending', 'sent', 'failed')",
+            name="ck_alert_events_delivery_status",
+        ),
+        Index(
+            "ix_alert_events_alert_rule_id_triggered_at",
+            "alert_rule_id",
+            desc("triggered_at"),
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    alert_rule_id: Mapped[int] = mapped_column(
+        ForeignKey("alert_rules.id", ondelete="CASCADE"), nullable=False
+    )
+    triggered_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    # NULL while the underlying condition still holds — an "open" alert.
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    trigger_price: Mapped[float | None] = mapped_column(Numeric(12, 2), nullable=True)
+    competitor_price: Mapped[float | None] = mapped_column(Numeric(12, 2), nullable=True)
+    competitor_product_id: Mapped[int | None] = mapped_column(
+        ForeignKey("products.id", ondelete="SET NULL"), nullable=True
+    )
+    message: Mapped[str] = mapped_column(String(1024), nullable=False)
+    delivery_status: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="pending"
+    )
+    delivery_error: Mapped[str | None] = mapped_column(String(2048), nullable=True)

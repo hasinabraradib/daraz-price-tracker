@@ -88,7 +88,11 @@ async def _clean_tables():
     truncate-before is the simplest reliable isolation between tests."""
     async with engine.begin() as conn:
         await conn.execute(
-            text("TRUNCATE products, price_snapshots, scrape_attempts RESTART IDENTITY CASCADE")
+            text(
+                "TRUNCATE products, price_snapshots, scrape_attempts, "
+                "product_competitors, alert_rules, alert_events "
+                "RESTART IDENTITY CASCADE"
+            )
         )
     yield
 

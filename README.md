@@ -1,7 +1,7 @@
 # daraz-price-tracker
 
 [![CI](https://github.com/hasinabraradib/daraz-price-tracker/actions/workflows/ci.yml/badge.svg)](https://github.com/hasinabraradib/daraz-price-tracker/actions/workflows/ci.yml)
-![coverage](https://img.shields.io/badge/coverage-83.5%25-brightgreen)
+![coverage](https://img.shields.io/badge/coverage-80.4%25-brightgreen)
 
 > The CI badge above will 404 until this repo exists at
 > `github.com/hasinabraradib/daraz-price-tracker` and the workflow has run
@@ -12,7 +12,8 @@
 
 A Daraz product price tracker: a FastAPI service backed by Postgres, a
 Redis-queued scraper worker driving headless Chromium via Playwright, async
-SQLAlchemy 2.0, and Alembic migrations.
+SQLAlchemy 2.0, Alembic migrations, and competitor-price alerting over
+email/webhook.
 
 ## Stack
 
@@ -22,6 +23,7 @@ SQLAlchemy 2.0, and Alembic migrations.
 - SQLAlchemy 2.0 (async, `asyncpg`)
 - PostgreSQL 16
 - Alembic for migrations
+- Mailhog (local SMTP catcher — dev/test email alerts land here, not a real inbox)
 - Docker Compose for local dev
 
 ## Getting started
@@ -32,7 +34,8 @@ docker compose up --build
 ```
 
 The API is available at http://localhost:8000. `GET /health` verifies the
-database connection (not faked — it runs a real `SELECT 1`).
+database connection (not faked — it runs a real `SELECT 1`). Mailhog's web
+UI (view alert emails sent in dev) is at http://localhost:8025.
 
 Migrations aren't applied automatically on container start:
 
@@ -114,28 +117,109 @@ The worker scrapes one page at a time, throttled by `POLITE_DELAY_SECONDS`
 no attempt to bypass bot detection or CAPTCHAs. See
 `worker/worker_app/scraper.py` for details.
 
+## Competitor tracking & alerting
+
+Link another tracked product as a competitor (`POST /products/{id}/competitors`),
+attach one or more alert rules to your product (`POST /products/{id}/alert-rules`),
+and the worker evaluates every active rule right after each successful
+scrape (`shared/alerts.py::evaluate_alerts`, called from
+`worker_app/main.py::_handle_success`).
+
+Three rule types:
+
+| `rule_type`      | Fires when...                                                        |
+|-------------------|-----------------------------------------------------------------------|
+| `undercut`        | any linked competitor's latest price is below yours                   |
+| `price_below`     | your price drops below `threshold_price`                              |
+| `back_in_stock`   | `in_stock` flips `false → true` since the previous snapshot            |
+
+Two delivery channels, both retrying transient failures with the *same*
+backoff module the scraper's own retries use (`shared/retry.py` —
+`compute_backoff_delay`, moved there from the worker in this phase
+specifically so `shared/notifiers.py` could reuse it instead of
+reimplementing backoff a second time):
+
+- **email** — SMTP via `aiosmtplib`, pointed at the local Mailhog service
+  by default (`SMTP_HOST=mailhog`, no real email needed for dev/tests). For
+  real delivery, point it at Gmail (`SMTP_HOST=smtp.gmail.com`,
+  `SMTP_PORT=587`, `SMTP_USE_TLS=true`, an app-password in
+  `SMTP_USERNAME`/`SMTP_PASSWORD`) or any other SMTP provider.
+- **webhook** — a JSON `POST` to `destination` via `httpx`.
+
+### Dedup strategy
+
+The full reasoning lives as a docstring at the top of `shared/alerts.py` —
+worth reading directly if you're changing this logic — but the short
+version:
+
+An `AlertEvent` is **open** while `resolved_at IS NULL`. On every
+evaluation run, for each rule, the condition is recomputed fresh from
+current data (never inferred from event history) and one of four things
+happens:
+
+1. **Condition false, no open event** → nothing to do.
+2. **Condition false, open event exists** → resolve it (`resolved_at = now`),
+   send a best-effort resolution notice.
+3. **Condition true, no open event** → fresh trigger. Open a new event and
+   notify (subject to cooldown, below).
+4. **Condition true, open event exists** → the interesting case. We do
+   *not* notify every scrape just because "still true" — only if something
+   **material** changed do we close the old event and open a new one:
+   - `undercut`: a *different* competitor is now cheapest, OR the undercut
+     gap moved by more than `ALERT_MATERIAL_CHANGE_PCT` (default 5%).
+   - `price_below`: the trigger price moved by more than
+     `ALERT_MATERIAL_CHANGE_PCT` since the open event's price.
+   - `back_in_stock`: never reaches case 4 at all — see below.
+
+**Cooldown** (`ALERT_COOLDOWN_MINUTES`, default 60) is a second,
+independent guard checked *before* any mutation in cases 3 and 4: even a
+fresh or materially-changed trigger is suppressed if this rule already
+opened an event within the cooldown window. This protects against a price
+that oscillates several times in a few minutes — each swing might be
+"material" on its own, but nobody wants a flood of email for it. If
+cooldown blocks a would-be re-trigger, the existing open event (if any) is
+left completely untouched, to be re-evaluated next run.
+
+**`back_in_stock`** is different in kind from the other two: it's an
+edge-triggered instant (the flip itself), not a condition you can
+meaningfully re-check "does it still hold" on later. Each firing creates an
+`AlertEvent` that's immediately self-resolved (`resolved_at == triggered_at`)
+— there's no persisting state to dedup against, just repeat *flips*, which
+cooldown alone guards against.
+
 ## Shared code
 
 `api/` and `worker/` are independent Docker images, but both need the same
-`Product`/`PriceSnapshot` models and the same Redis queue functions (the API
-enqueues jobs and reports queue depth; the worker dequeues and writes
-snapshots). Rather than duplicate that code in both services, it lives in a
+models, queue functions, and (as of this phase) retry math and alert
+evaluation. Rather than duplicate that code in both services, it lives in a
 top-level `shared/` package:
 
 - `shared/config.py` — `pydantic-settings` config, read from env vars
 - `shared/database.py` — async SQLAlchemy engine/session, `Base`
-- `shared/models.py` — `Product`, `PriceSnapshot`, `ScrapeAttempt`
+- `shared/models.py` — `Product`, `PriceSnapshot`, `ScrapeAttempt`,
+  `ProductCompetitor`, `AlertRule`, `AlertEvent`
 - `shared/queue.py` — main queue, delayed-retry sorted set, and dead letter
   hash: `enqueue_job()`, `dequeue_job()`, `queue_depth()`,
   `schedule_retry()`, `promote_due_jobs()`, `delayed_queue_depth()`,
   `dead_letter()`, `dead_letter_depth()`, `list_dead_letters()`,
   `get_dead_letter()`, `replay_dead_letter()`, `purge_dead_letter()`
+- `shared/retry.py` — `compute_backoff_delay()`, the full-jitter exponential
+  backoff used by both the scraper's retries and `shared/notifiers.py`'s
+  notification retries. Moved here from the worker in this phase
+  specifically so notifiers could reuse it without a second implementation.
+- `shared/notifiers.py` — `send_notification()`: email (SMTP via
+  `aiosmtplib`) or webhook (`httpx` POST) delivery, retried via
+  `shared/retry.py`.
+- `shared/alerts.py` — `evaluate_alerts()`: the rule evaluation and dedup
+  engine described above.
 
 Both Dockerfiles build from the **repo root** (not their own subdirectory)
 so they can `COPY shared ./shared` alongside their own app code.
-`worker/worker_app/queue.py` still exists as its own file (per the intended layout)
-but just re-exports from `shared/queue.py`, since the API needs those same
-functions for `POST /products/{id}/scrape` and `GET /queue/depth`.
+`worker/worker_app/queue.py` and `worker/worker_app/retry.py` still exist as
+their own files (per the intended layout) but just re-export from
+`shared/queue.py` / `shared/retry.py`, since the API needs the queue
+functions too (`POST /products/{id}/scrape`, `GET /queue/depth`) and
+`shared/notifiers.py` needs the retry math.
 
 `api/app` and `worker/worker_app` are separate top-level Python packages —
 inside their own Docker containers each is just `app`, imported the same
@@ -153,22 +237,42 @@ one process — doesn't have two same-named top-level packages colliding.
 - **scrape_attempts** — one row per attempt, success *or* failure, with
   error type/message and duration. Indexed on
   `(product_id, attempted_at desc)`.
+- **product_competitors** — "watch this competitor for this product of
+  mine." Unique on `(product_id, competitor_product_id)`; a CHECK constraint
+  blocks a product from competing with itself.
+- **alert_rules** — one row per configured alert (`rule_type`,
+  `threshold_price` for `price_below`, delivery `channel`+`destination`,
+  `is_active`). `rule_type`/`channel` are CHECK-constrained rather than
+  native Postgres enums, matching the rest of this schema's plain-`String`
+  style — avoids the migration ceremony of altering a Postgres enum type
+  later.
+- **alert_events** — one row per alert firing/resolution. `resolved_at IS
+  NULL` means open; see the dedup strategy above. Indexed on
+  `(alert_rule_id, triggered_at desc)`.
 
 ## API
 
-| Method | Path                          | Description                                  |
-|--------|-------------------------------|-----------------------------------------------|
-| GET    | `/health`                     | DB connectivity check                          |
-| POST   | `/products`                   | Add a product by Daraz URL                     |
-| GET    | `/products`                   | List products with their latest price          |
-| GET    | `/products/{id}/history`      | Price snapshots over time, newest first        |
-| GET    | `/products/{id}/attempts`     | Scrape attempt history for one product         |
-| POST   | `/products/{id}/scrape`       | Enqueue a scrape job for a product              |
-| GET    | `/queue/depth`                | Current Redis queue depth                       |
-| GET    | `/dead-letters`                | List dead-lettered jobs with failure reason     |
-| POST   | `/dead-letters/{job_id}/replay`| Push a dead-lettered job back onto the main queue |
-| DELETE | `/dead-letters/{job_id}`       | Discard a dead-lettered job                     |
-| GET    | `/stats/scrape-health`         | Success rate, failures by error type, queue/DLQ depth |
+| Method | Path                              | Description                                       |
+|--------|-----------------------------------|-----------------------------------------------------|
+| GET    | `/health`                         | DB connectivity check                                |
+| POST   | `/products`                       | Add a product by Daraz URL                           |
+| GET    | `/products`                       | List products with their latest price                |
+| GET    | `/products/{id}/history`          | Price snapshots over time, newest first               |
+| GET    | `/products/{id}/attempts`         | Scrape attempt history for one product                |
+| POST   | `/products/{id}/scrape`           | Enqueue a scrape job for a product                    |
+| GET    | `/queue/depth`                    | Current Redis queue depth                             |
+| GET    | `/dead-letters`                   | List dead-lettered jobs with failure reason            |
+| POST   | `/dead-letters/{job_id}/replay`   | Push a dead-lettered job back onto the main queue      |
+| DELETE | `/dead-letters/{job_id}`          | Discard a dead-lettered job                            |
+| GET    | `/stats/scrape-health`            | Success rate, failures by error type, queue/DLQ depth  |
+| POST   | `/products/{id}/competitors`      | Link a competitor product                              |
+| GET    | `/products/{id}/competitors`      | List competitors with latest price + gap vs this product |
+| DELETE | `/products/{id}/competitors/{competitor_id}` | Unlink a competitor                          |
+| GET    | `/products/{id}/comparison`       | This product + all competitors, cheapest flagged       |
+| POST   | `/products/{id}/alert-rules`      | Create an alert rule                                   |
+| GET    | `/products/{id}/alert-rules`      | List a product's alert rules                           |
+| DELETE | `/products/{id}/alert-rules/{rule_id}` | Delete an alert rule                              |
+| GET    | `/alerts`                         | Recent AlertEvents, filterable by `product_id`/`status` |
 
 ## Migrations
 
@@ -196,9 +300,9 @@ replaced with `fakeredis` for every test via an autouse fixture in
 `tests/conftest.py`. The scraper's Playwright calls are always mocked too — no
 test in this suite makes a real network call.
 
-Last local run: **59 passed, 83.5% coverage** (`--cov-fail-under=70`, enforced
-in CI). What's *not* covered, and why that's an accepted gap rather than an
-oversight:
+Last local run: **85 passed, 80.4% coverage** (`--cov-fail-under=70`,
+enforced in CI). What's *not* covered, and why that's an accepted gap
+rather than an oversight:
 
 - **`worker_app/main.py`'s `worker_loop`, `promoter_loop`, and `run()`**
   (~45% of that file) — these are `while True:` loops wrapping the
@@ -207,10 +311,24 @@ oversight:
   out of it artificially (tests the harness, not the code) or an
   integration test that starts a real worker process. These were verified
   by hand against the live stack (real 404 → terminal, real backoff growth
-  in Redis, real 5-attempt exhaustion → DLQ → replay — see the worker/DLQ
-  phase of this project's history), just not by anything `pytest` runs.
-  Worth an integration test with a real `docker compose` stack if this
-  becomes CI-gated later; not worth faking here.
+  in Redis, real 5-attempt exhaustion → DLQ → replay), just not by anything
+  `pytest` runs. Worth an integration test with a real `docker compose`
+  stack if this becomes CI-gated later; not worth faking here.
+- **`shared/notifiers.py`'s `_send_email`/`_send_webhook`** (~29% of that
+  file) — `test_alerts.py` mocks `send_notification` at its outer boundary
+  (per the task's "no real SMTP/HTTP in tests" instruction), so the
+  actual `aiosmtplib`/`httpx` calls inside are never exercised by `pytest`.
+  They *are* real-verified: the live end-to-end check for this phase sent
+  genuine SMTP traffic to Mailhog and confirmed the email landed
+  (`GET http://localhost:8025/api/v2/messages`) — same "live-verified,
+  not pytest-verified" situation as the worker loops above.
+- **`api/app/routers/competitors.py` and `alert_rules.py`** (52%/62%) —
+  the core paths (create/list/delete, self-link rejection, duplicate
+  rejection, 404s) are tested; some less-interesting branches (e.g. a
+  competitor with zero snapshots yet in a couple of list-endpoint code
+  paths) aren't individually covered. Not worth chasing every branch by
+  hand when the underlying `evaluate_alerts`/query logic they call is
+  already thoroughly tested in `test_alerts.py`.
 - **A few individual `except`/`raise` lines in `api/app/routers/products.py`**
   (e.g. the `IntegrityError` → 409 branch) show as partially covered
   despite `test_create_duplicate_product_returns_409` passing and clearly
@@ -237,6 +355,9 @@ daraz-price-tracker/
 │   │   ├── main.py          # FastAPI app, router wiring, /health
 │   │   ├── routers/
 │   │   │   ├── products.py     # /products endpoints, incl. /attempts
+│   │   │   ├── competitors.py  # /products/{id}/competitors, /comparison
+│   │   │   ├── alert_rules.py  # /products/{id}/alert-rules
+│   │   │   ├── alerts.py       # /alerts
 │   │   │   ├── queue.py        # /queue/depth
 │   │   │   ├── dead_letters.py # /dead-letters endpoints
 │   │   │   └── stats.py        # /stats/scrape-health
@@ -247,23 +368,28 @@ daraz-price-tracker/
 │   └── requirements.txt
 ├── worker/
 │   ├── worker_app/          # importable as `worker_app` — see "Shared code" above
-│   │   ├── main.py          # dequeue loop + promoter loop, retry decisions
+│   │   ├── main.py          # dequeue loop + promoter loop, retry decisions, alert evaluation
 │   │   ├── scraper.py       # Playwright scraper + exception hierarchy
-│   │   ├── retry.py         # exponential backoff + full jitter
+│   │   ├── retry.py         # re-exports shared/retry.py
 │   │   └── queue.py         # re-exports shared/queue.py
 │   ├── Dockerfile
 │   └── requirements.txt
 ├── shared/
 │   ├── config.py
 │   ├── database.py
-│   ├── models.py            # Product, PriceSnapshot, ScrapeAttempt
-│   └── queue.py             # queue + delayed retry zset + dead letter hash
+│   ├── models.py            # Product, PriceSnapshot, ScrapeAttempt,
+│   │                         # ProductCompetitor, AlertRule, AlertEvent
+│   ├── queue.py              # queue + delayed retry zset + dead letter hash
+│   ├── retry.py              # exponential backoff + full jitter
+│   ├── notifiers.py          # email/webhook delivery, retried via retry.py
+│   └── alerts.py             # rule evaluation + dedup engine
 ├── tests/
 │   ├── conftest.py          # test DB + fakeredis + httpx client fixtures
 │   ├── test_retry.py        # backoff math, jitter, max-attempts
 │   ├── test_error_classification.py  # exception hierarchy, mocked Playwright
 │   ├── test_queue.py        # enqueue/dequeue/retry/DLQ, via fakeredis
 │   ├── test_url_utils.py    # daraz_url normalization/validation
+│   ├── test_alerts.py       # rule firing, dedup, cooldown, resolution
 │   └── test_api.py          # FastAPI endpoints, via httpx ASGI transport
 ├── .github/workflows/ci.yml # test (matrix) -> lint -> build, gha layer cache
 ├── pyproject.toml           # pytest, coverage, ruff config

@@ -31,6 +31,8 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      mailhog:
+        condition: service_started
 
   postgres:
     image: postgres:16-alpine
@@ -59,6 +61,12 @@ services:
       interval: 5s
       timeout: 5s
       retries: 5
+
+  mailhog:
+    image: mailhog/mailhog:v1.0.1
+    ports:
+      - "1025:1025"  # SMTP — AlertRule(channel="email") sends here in dev
+      - "8025:8025"  # web UI — view "sent" mail at http://localhost:8025
 
 volumes:
   postgres_data:
