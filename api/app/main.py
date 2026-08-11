@@ -3,12 +3,14 @@ from sqlalchemy import text
 
 from shared.database import engine
 
-from app.routers import products, queue
+from app.routers import dead_letters, products, queue, stats
 
 app = FastAPI(title="Daraz Price Tracker")
 
 app.include_router(products.router)
 app.include_router(queue.router)
+app.include_router(dead_letters.router)
+app.include_router(stats.router)
 
 
 @app.get("/health")

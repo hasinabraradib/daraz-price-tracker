@@ -48,18 +48,54 @@ docker compose run --rm api alembic upgrade head
 `api` and `worker` are separate services/images, but they share one package
 of database and queue code — see **Shared code** below.
 
-### Queue
+### Queue, retries, and the dead letter queue
 
-`POST /products/{id}/scrape` (or nothing yet, since nothing schedules jobs
-on its own in this phase) pushes a JSON job onto a Redis list:
+`POST /products/{id}/scrape` pushes a JSON job onto a Redis list:
 
 ```json
-{"product_id": 1, "url": "https://...", "attempt": 1, "enqueued_at": "2026-08-11T12:00:00+00:00"}
+{
+  "job_id": "a1b2c3...",
+  "product_id": 1,
+  "url": "https://...",
+  "attempt": 1,
+  "enqueued_at": "2026-08-11T12:00:00+00:00",
+  "attempt_history": []
+}
 ```
 
-The worker blocking-pops (`BLPOP`) jobs off that list, scrapes the page, and
-writes a `PriceSnapshot` row. Failures are logged as structured JSON and
-dropped — retry logic is a later phase, not implemented here.
+The worker blocking-pops (`BLPOP`) jobs off that list and scrapes. What
+happens next depends on how it fails — see `worker/app/scraper.py`'s
+exception hierarchy:
+
+- **`TerminalScrapeError`** (404/410 "product gone", malformed URL) —
+  dead-lettered immediately, no retry. Retrying a 404 wastes an attempt on
+  something that will never succeed.
+- **`RetryableScrapeError`** (timeouts, network errors, 5xx, 429) —
+  scheduled for retry with exponential backoff + full jitter
+  (`worker/app/retry.py`): `delay = random.uniform(0, min(base * factor^(attempt-1), max_delay))`,
+  defaults base=5s, factor=2, max=10min, capped at `RETRY_MAX_ATTEMPTS` (default 5).
+- **`SelectorScrapeError`** (page loaded fine, but our selectors found
+  nothing) — a subclass of `RetryableScrapeError`, but capped at exactly
+  one retry regardless of the attempt budget: if the *next* attempt also
+  fails on selectors, that's not noise, it means Daraz changed their
+  markup, and no amount of retrying fixes that. See
+  `_handle_failure`/`_previous_attempt_was_selector_error` in
+  `worker/app/main.py`.
+
+Backoff delays are **not** `time.sleep()` — that would block the worker
+and be lost on a restart. Instead, a retry is written to a Redis sorted set
+(`scrape_jobs:delayed`, score = the unix timestamp it becomes eligible). A
+second coroutine in the worker (`promoter_loop`) polls that set every 2s and
+moves due jobs back onto the main queue.
+
+Once a job exhausts its attempts (or fails terminally), it's pushed into a
+Redis hash (`scrape_jobs:dead`) with the original job, every attempt's
+timestamp/error, and the final error — inspectable and replayable via the
+`/dead-letters` endpoints below.
+
+Every attempt, success or failure, is also written to Postgres as a
+`ScrapeAttempt` row — that's what makes success-rate-per-product a real
+queryable metric (`GET /stats/scrape-health`), not just log-scraping.
 
 ### Scraper politeness
 
@@ -78,8 +114,12 @@ top-level `shared/` package:
 
 - `shared/config.py` — `pydantic-settings` config, read from env vars
 - `shared/database.py` — async SQLAlchemy engine/session, `Base`
-- `shared/models.py` — `Product`, `PriceSnapshot`
-- `shared/queue.py` — `enqueue_job()`, `dequeue_job()`, `queue_depth()`
+- `shared/models.py` — `Product`, `PriceSnapshot`, `ScrapeAttempt`
+- `shared/queue.py` — main queue, delayed-retry sorted set, and dead letter
+  hash: `enqueue_job()`, `dequeue_job()`, `queue_depth()`,
+  `schedule_retry()`, `promote_due_jobs()`, `delayed_queue_depth()`,
+  `dead_letter()`, `dead_letter_depth()`, `list_dead_letters()`,
+  `get_dead_letter()`, `replay_dead_letter()`, `purge_dead_letter()`
 
 Both Dockerfiles build from the **repo root** (not their own subdirectory)
 so they can `COPY shared ./shared` alongside their own app code.
@@ -90,20 +130,28 @@ functions for `POST /products/{id}/scrape` and `GET /queue/depth`.
 ## Database schema
 
 - **products** — tracked Daraz product URLs.
-- **price_snapshots** — one row per scrape, with price, currency, stock
-  status, and the raw scraped title. Indexed on `(product_id, scraped_at desc)`
-  for fast "latest price history" queries.
+- **price_snapshots** — one row per successful scrape, with price, currency,
+  stock status, and the raw scraped title. Indexed on
+  `(product_id, scraped_at desc)` for fast "latest price history" queries.
+- **scrape_attempts** — one row per attempt, success *or* failure, with
+  error type/message and duration. Indexed on
+  `(product_id, attempted_at desc)`.
 
 ## API
 
-| Method | Path                        | Description                                  |
-|--------|-----------------------------|-----------------------------------------------|
-| GET    | `/health`                   | DB connectivity check                          |
-| POST   | `/products`                 | Add a product by Daraz URL                     |
-| GET    | `/products`                 | List products with their latest price          |
-| GET    | `/products/{id}/history`    | Price snapshots over time, newest first        |
-| POST   | `/products/{id}/scrape`     | Enqueue a scrape job for a product              |
-| GET    | `/queue/depth`               | Current Redis queue depth                       |
+| Method | Path                          | Description                                  |
+|--------|-------------------------------|-----------------------------------------------|
+| GET    | `/health`                     | DB connectivity check                          |
+| POST   | `/products`                   | Add a product by Daraz URL                     |
+| GET    | `/products`                   | List products with their latest price          |
+| GET    | `/products/{id}/history`      | Price snapshots over time, newest first        |
+| GET    | `/products/{id}/attempts`     | Scrape attempt history for one product         |
+| POST   | `/products/{id}/scrape`       | Enqueue a scrape job for a product              |
+| GET    | `/queue/depth`                | Current Redis queue depth                       |
+| GET    | `/dead-letters`                | List dead-lettered jobs with failure reason     |
+| POST   | `/dead-letters/{job_id}/replay`| Push a dead-lettered job back onto the main queue |
+| DELETE | `/dead-letters/{job_id}`       | Discard a dead-lettered job                     |
+| GET    | `/stats/scrape-health`         | Success rate, failures by error type, queue/DLQ depth |
 
 ## Migrations
 
@@ -123,24 +171,28 @@ daraz-price-tracker/
 │   ├── app/
 │   │   ├── main.py          # FastAPI app, router wiring, /health
 │   │   ├── routers/
-│   │   │   ├── products.py  # /products endpoints
-│   │   │   └── queue.py     # /queue/depth
-│   │   └── schemas.py       # Pydantic v2 request/response models
+│   │   │   ├── products.py     # /products endpoints, incl. /attempts
+│   │   │   ├── queue.py        # /queue/depth
+│   │   │   ├── dead_letters.py # /dead-letters endpoints
+│   │   │   └── stats.py        # /stats/scrape-health
+│   │   ├── schemas.py       # Pydantic v2 request/response models
+│   │   └── url_utils.py     # daraz_url normalization
 │   ├── alembic/
 │   ├── Dockerfile
 │   └── requirements.txt
 ├── worker/
 │   ├── app/
-│   │   ├── main.py          # blocking-pop loop, writes PriceSnapshot
-│   │   ├── scraper.py       # Playwright-based Daraz scraper
+│   │   ├── main.py          # dequeue loop + promoter loop, retry decisions
+│   │   ├── scraper.py       # Playwright scraper + exception hierarchy
+│   │   ├── retry.py         # exponential backoff + full jitter
 │   │   └── queue.py         # re-exports shared/queue.py
 │   ├── Dockerfile
 │   └── requirements.txt
 ├── shared/
 │   ├── config.py
 │   ├── database.py
-│   ├── models.py            # Product, PriceSnapshot
-│   └── queue.py             # Redis queue mechanics
+│   ├── models.py            # Product, PriceSnapshot, ScrapeAttempt
+│   └── queue.py             # queue + delayed retry zset + dead letter hash
 ├── docker-compose.yml
 ├── .env.example
 └── .gitignore

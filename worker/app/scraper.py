@@ -13,7 +13,9 @@ import asyncio
 import time
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
+from urllib.parse import urlsplit
 
+from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from playwright.async_api import async_playwright
 
@@ -40,7 +42,30 @@ _delay_lock = asyncio.Lock()
 
 
 class ScrapeError(Exception):
-    """Raised when a product page can't be scraped, with a clear reason."""
+    """Base class for scrape failures, with a clear reason. Don't raise this
+    directly — raise one of the subclasses below so the worker knows
+    whether retrying is worthwhile."""
+
+
+class RetryableScrapeError(ScrapeError):
+    """Transient failure that may well succeed on a later attempt:
+    timeouts, network errors, 5xx responses, 429 rate limiting."""
+
+
+class TerminalScrapeError(ScrapeError):
+    """Permanent failure — retrying changes nothing: 404/410 (the product
+    is gone), or a malformed URL that was never going to resolve."""
+
+
+class SelectorScrapeError(RetryableScrapeError):
+    """The page loaded (2xx) but our selectors didn't match anything.
+    Retryable, but the worker allows this exactly once per job: a single
+    selector miss is often a transient render hiccup, but if it happens
+    *again* on the very next attempt for the same job, that's not noise —
+    it means Daraz changed their markup, and burning the rest of the
+    attempt budget won't fix that. See worker/app/main.py's
+    `_previous_attempt_was_selector_error` check, which dead-letters on
+    the second consecutive occurrence instead of retrying further."""
 
 
 @dataclass
@@ -49,6 +74,12 @@ class ScrapedProduct:
     price: Decimal
     currency: str
     in_stock: bool
+
+
+def _validate_url(url: str) -> None:
+    parts = urlsplit(url)
+    if parts.scheme not in ("http", "https") or not parts.netloc:
+        raise TerminalScrapeError(f"malformed URL: {url!r}")
 
 
 async def _respect_polite_delay() -> None:
@@ -67,13 +98,16 @@ def _parse_price(raw: str) -> Decimal:
     try:
         return Decimal(digits)
     except InvalidOperation as exc:
-        raise ScrapeError(f"could not parse price from {raw!r}") from exc
+        # The price node existed but its content wasn't a price we
+        # recognize — that's a content/format change, same story as a
+        # missing selector, so it gets the same "retry once" treatment.
+        raise SelectorScrapeError(f"could not parse price from {raw!r}") from exc
 
 
 def _parse_currency(raw: str) -> str:
     symbol = "".join(ch for ch in raw if not (ch.isdigit() or ch in ".,- ")).strip()
     if not symbol:
-        raise ScrapeError(f"could not determine currency from {raw!r}")
+        raise SelectorScrapeError(f"could not determine currency from {raw!r}")
     return symbol
 
 
@@ -91,7 +125,24 @@ async def _detect_in_stock(page) -> bool:
     return True
 
 
+def _raise_for_status(status: int, url: str) -> None:
+    if status in (404, 410):
+        raise TerminalScrapeError(f"product page returned {status} (gone): {url}")
+    if status == 429:
+        raise RetryableScrapeError(f"rate limited (429) loading {url}")
+    if 500 <= status < 600:
+        raise RetryableScrapeError(f"server error ({status}) loading {url}")
+    if status >= 400:
+        # Other 4xx (400, 401, 403, ...) don't have an explicit rule in the
+        # spec this scraper was built against. We default to terminal since
+        # "client error" usually means retrying with the same request won't
+        # help — but a 403 could plausibly be a transient bot-block, worth
+        # revisiting if that turns out to happen in practice.
+        raise TerminalScrapeError(f"unexpected client error ({status}) loading {url}")
+
+
 async def scrape_product(url: str) -> ScrapedProduct:
+    _validate_url(url)
     await _respect_polite_delay()
 
     async with async_playwright() as playwright:
@@ -101,16 +152,23 @@ async def scrape_product(url: str) -> ScrapedProduct:
             page.set_default_timeout(PAGE_TIMEOUT_MS)
 
             try:
-                await page.goto(url, wait_until="domcontentloaded")
+                response = await page.goto(url, wait_until="domcontentloaded")
             except PlaywrightTimeoutError as exc:
-                raise ScrapeError(f"timed out loading {url}") from exc
+                raise RetryableScrapeError(f"timed out loading {url}") from exc
+            except PlaywrightError as exc:
+                # DNS failures, connection refused/reset, TLS errors, etc.
+                raise RetryableScrapeError(f"network error loading {url}: {exc}") from exc
+
+            if response is None:
+                raise RetryableScrapeError(f"no response received for {url}")
+            _raise_for_status(response.status, url)
 
             try:
                 await page.wait_for_selector(TITLE_SELECTOR, timeout=PAGE_TIMEOUT_MS)
                 # the price node can render a beat after the title does
                 await page.wait_for_selector(PRICE_SELECTOR, timeout=PAGE_TIMEOUT_MS)
             except PlaywrightTimeoutError as exc:
-                raise ScrapeError(
+                raise SelectorScrapeError(
                     f"product page did not render expected content: {url}"
                 ) from exc
 
@@ -118,7 +176,7 @@ async def scrape_product(url: str) -> ScrapedProduct:
             price_el = await page.query_selector(PRICE_SELECTOR)
 
             if title_el is None or price_el is None:
-                raise ScrapeError(f"missing title or price element on {url}")
+                raise SelectorScrapeError(f"missing title or price element on {url}")
 
             title = (await title_el.inner_text()).strip()
             # Price is read only from the rendered DOM, never from the URL —

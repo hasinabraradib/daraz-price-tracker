@@ -4,7 +4,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from shared.database import get_db
-from shared.models import PriceSnapshot, Product
+from shared.models import PriceSnapshot, Product, ScrapeAttempt
 from shared.queue import enqueue_job
 from shared.queue import queue_depth as get_queue_depth
 
@@ -14,6 +14,7 @@ from app.schemas import (
     ProductCreate,
     ProductRead,
     ProductWithLatestPrice,
+    ScrapeAttemptRead,
     ScrapeQueuedResponse,
 )
 from app.url_utils import normalize_daraz_url
@@ -77,6 +78,20 @@ async def product_history(product_id: int, db: AsyncSession = Depends(get_db)):
         select(PriceSnapshot)
         .where(PriceSnapshot.product_id == product_id)
         .order_by(PriceSnapshot.scraped_at.desc())
+    )
+    return (await db.execute(stmt)).scalars().all()
+
+
+@router.get("/{product_id}/attempts", response_model=list[ScrapeAttemptRead])
+async def product_attempts(product_id: int, db: AsyncSession = Depends(get_db)):
+    product = await db.get(Product, product_id)
+    if product is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="product not found")
+
+    stmt = (
+        select(ScrapeAttempt)
+        .where(ScrapeAttempt.product_id == product_id)
+        .order_by(ScrapeAttempt.attempted_at.desc())
     )
     return (await db.execute(stmt)).scalars().all()
 

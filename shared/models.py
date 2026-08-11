@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Index, Numeric, String, func
+from sqlalchemy import Boolean, DateTime, ForeignKey, Index, Integer, Numeric, String, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from sqlalchemy.sql import desc
 
@@ -19,6 +19,9 @@ class Product(Base):
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
 
     price_snapshots: Mapped[list["PriceSnapshot"]] = relationship(
+        back_populates="product", cascade="all, delete-orphan"
+    )
+    scrape_attempts: Mapped[list["ScrapeAttempt"]] = relationship(
         back_populates="product", cascade="all, delete-orphan"
     )
 
@@ -46,3 +49,29 @@ class PriceSnapshot(Base):
     raw_title: Mapped[str | None] = mapped_column(String(1024), nullable=True)
 
     product: Mapped["Product"] = relationship(back_populates="price_snapshots")
+
+
+class ScrapeAttempt(Base):
+    __tablename__ = "scrape_attempts"
+    __table_args__ = (
+        Index(
+            "ix_scrape_attempts_product_id_attempted_at",
+            "product_id",
+            desc("attempted_at"),
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    product_id: Mapped[int] = mapped_column(
+        ForeignKey("products.id", ondelete="CASCADE"), nullable=False
+    )
+    attempted_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    success: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    error_type: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    error_message: Mapped[str | None] = mapped_column(String(2048), nullable=True)
+    duration_ms: Mapped[int] = mapped_column(Integer, nullable=False)
+    attempt_number: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    product: Mapped["Product"] = relationship(back_populates="scrape_attempts")
