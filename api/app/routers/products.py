@@ -3,11 +3,6 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from shared.database import get_db
-from shared.models import PriceSnapshot, Product, ScrapeAttempt
-from shared.queue import enqueue_job
-from shared.queue import queue_depth as get_queue_depth
-
 from app.schemas import (
     LatestPrice,
     PriceSnapshotRead,
@@ -17,25 +12,34 @@ from app.schemas import (
     ScrapeAttemptRead,
     ScrapeQueuedResponse,
 )
-from app.url_utils import normalize_daraz_url
+from app.url_utils import InvalidProductUrlError, normalize_daraz_url
+from shared.database import get_db
+from shared.models import PriceSnapshot, Product, ScrapeAttempt
+from shared.queue import enqueue_job
+from shared.queue import queue_depth as get_queue_depth
 
 router = APIRouter(prefix="/products", tags=["products"])
 
 
 @router.post("", response_model=ProductRead, status_code=status.HTTP_201_CREATED)
 async def create_product(payload: ProductCreate, db: AsyncSession = Depends(get_db)):
-    product = Product(
-        name=payload.name, daraz_url=normalize_daraz_url(str(payload.daraz_url))
-    )
+    try:
+        daraz_url = normalize_daraz_url(str(payload.daraz_url))
+    except InvalidProductUrlError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)
+        ) from exc
+
+    product = Product(name=payload.name, daraz_url=daraz_url)
     db.add(product)
     try:
         await db.commit()
-    except IntegrityError:
+    except IntegrityError as exc:
         await db.rollback()
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="a product with this daraz_url already exists",
-        )
+        ) from exc
     await db.refresh(product)
     return product
 

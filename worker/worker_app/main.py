@@ -9,9 +9,9 @@ from shared.config import settings
 from shared.database import async_session_factory
 from shared.models import PriceSnapshot, ScrapeAttempt
 
-from app.queue import dead_letter, dequeue_job, promote_due_jobs, schedule_retry
-from app.retry import compute_backoff_delay
-from app.scraper import (
+from .queue import dead_letter, dequeue_job, promote_due_jobs, schedule_retry
+from .retry import compute_backoff_delay
+from .scraper import (
     ScrapedProduct,
     ScrapeError,
     SelectorScrapeError,

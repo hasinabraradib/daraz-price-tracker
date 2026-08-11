@@ -22,7 +22,7 @@ services:
       context: .
       dockerfile: worker/Dockerfile
     volumes:
-      - ./worker/app:/code/app
+      - ./worker/worker_app:/code/app
       - ./shared:/code/shared
     env_file:
       - .env

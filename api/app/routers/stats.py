@@ -2,12 +2,11 @@ from fastapi import APIRouter, Depends
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.schemas import ScrapeHealthStats
 from shared.database import get_db
 from shared.models import ScrapeAttempt
 from shared.queue import dead_letter_depth, delayed_queue_depth
 from shared.queue import queue_depth as get_queue_depth
-
-from app.schemas import ScrapeHealthStats
 
 router = APIRouter(prefix="/stats", tags=["stats"])
 

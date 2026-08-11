@@ -1,0 +1,30 @@
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "session"
+testpaths = ["tests"]
+
+[tool.coverage.run]
+branch = true
+
+[tool.coverage.report]
+fail_under = 70
+show_missing = true
+exclude_lines = [
+    "pragma: no cover",
+    "if __name__ == .__main__.:",
+]
+
+[tool.ruff]
+# The api image runs Python 3.11, but the worker image is built on
+# mcr.microsoft.com/playwright/python:v1.49.0-jammy, which is Python 3.10.
+# Target the lower of the two so ruff never suggests a 3.11-only construct
+# (e.g. `datetime.UTC`) for code that has to run on the worker.
+target-version = "py310"
+line-length = 100
+extend-exclude = ["api/alembic/versions"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+ignore = [
+    "B008",  # FastAPI's Depends(...) as a default arg is intentional
+]

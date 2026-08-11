@@ -1,8 +1,7 @@
 from fastapi import APIRouter
 
-from shared.queue import queue_depth
-
 from app.schemas import QueueDepthResponse
+from shared.queue import queue_depth
 
 router = APIRouter(prefix="/queue", tags=["queue"])
 

@@ -10,6 +10,7 @@ Daraz product pages are JS-heavy (client-side rendered), so we drive a real
 headless browser via Playwright rather than requests+BeautifulSoup.
 """
 import asyncio
+import re
 import time
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
@@ -93,10 +94,18 @@ async def _respect_polite_delay() -> None:
         _last_request_at = time.monotonic()
 
 
+_PRICE_TOKEN = re.compile(r"\d[\d,]*(?:\.\d+)?")
+
+
 def _parse_price(raw: str) -> Decimal:
-    digits = "".join(ch for ch in raw if ch.isdigit() or ch in ".-")
+    # Extract the numeric token itself rather than collecting every digit
+    # and '.'/'-' character in the string — currency prefixes like "Rs."
+    # have their own period, which isn't part of the number.
+    match = _PRICE_TOKEN.search(raw)
+    if match is None:
+        raise SelectorScrapeError(f"could not parse price from {raw!r}")
     try:
-        return Decimal(digits)
+        return Decimal(match.group().replace(",", ""))
     except InvalidOperation as exc:
         # The price node existed but its content wasn't a price we
         # recognize — that's a content/format change, same story as a

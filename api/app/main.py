@@ -1,9 +1,8 @@
 from fastapi import FastAPI
 from sqlalchemy import text
 
-from shared.database import engine
-
 from app.routers import dead_letters, products, queue, stats
+from shared.database import engine
 
 app = FastAPI(title="Daraz Price Tracker")
 
