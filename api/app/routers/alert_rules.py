@@ -30,6 +30,7 @@ async def create_alert_rule(
         product_id=product_id,
         rule_type=payload.rule_type,
         threshold_price=payload.threshold_price,
+        threshold_pct=payload.threshold_pct,
         channel=payload.channel,
         destination=payload.destination,
     )

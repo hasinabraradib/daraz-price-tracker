@@ -1,7 +1,7 @@
 # daraz-price-tracker
 
 [![CI](https://github.com/hasinabraradib/daraz-price-tracker/actions/workflows/ci.yml/badge.svg)](https://github.com/hasinabraradib/daraz-price-tracker/actions/workflows/ci.yml)
-![coverage](https://img.shields.io/badge/coverage-80.4%25-brightgreen)
+![coverage](https://img.shields.io/badge/coverage-81.2%25-brightgreen)
 
 > The CI badge above will 404 until this repo exists at
 > `github.com/hasinabraradib/daraz-price-tracker` and the workflow has run
@@ -12,8 +12,9 @@
 
 A Daraz product price tracker: a FastAPI service backed by Postgres, a
 Redis-queued scraper worker driving headless Chromium via Playwright, async
-SQLAlchemy 2.0, Alembic migrations, and competitor-price alerting over
-email/webhook.
+SQLAlchemy 2.0, Alembic migrations, and price/stock alerting over
+email, Discord, or generic webhook — for sellers watching competitors and
+for shoppers watching a price.
 
 ## Stack
 
@@ -24,6 +25,7 @@ email/webhook.
 - PostgreSQL 16
 - Alembic for migrations
 - Mailhog (local SMTP catcher — dev/test email alerts land here, not a real inbox)
+- Discord webhooks (auto-detected — see **Alert delivery** below)
 - Docker Compose for local dev
 
 ## Getting started
@@ -123,34 +125,63 @@ Link another tracked product as a competitor (`POST /products/{id}/competitors`)
 attach one or more alert rules to your product (`POST /products/{id}/alert-rules`),
 and the worker evaluates every active rule right after each successful
 scrape (`shared/alerts.py::evaluate_alerts`, called from
-`worker_app/main.py::_handle_success`).
+`worker_app/main.py::_handle_success`). The same system serves two
+audiences: `undercut` is for sellers watching competitors; `price_below`,
+`price_drop_pct`, and `back_in_stock` are for shoppers watching a price.
 
-Three rule types:
+Four rule types, two different *shapes* of condition:
 
-| `rule_type`      | Fires when...                                                        |
-|-------------------|-----------------------------------------------------------------------|
-| `undercut`        | any linked competitor's latest price is below yours                   |
-| `price_below`     | your price drops below `threshold_price`                              |
-| `back_in_stock`   | `in_stock` flips `false → true` since the previous snapshot            |
+| `rule_type`      | Fires when...                                                          | Shape        |
+|-------------------|--------------------------------------------------------------------------|--------------|
+| `undercut`        | any linked competitor's latest price is below yours                      | persisting   |
+| `price_below`     | your price drops below `threshold_price`                                 | persisting   |
+| `price_drop_pct`  | price drops by more than `threshold_pct` vs. the *immediately prior* snapshot | edge-triggered |
+| `back_in_stock`   | `in_stock` flips `false → true` since the previous snapshot               | persisting   |
 
-Two delivery channels, both retrying transient failures with the *same*
-backoff module the scraper's own retries use (`shared/retry.py` —
-`compute_backoff_delay`, moved there from the worker in this phase
-specifically so `shared/notifiers.py` could reuse it instead of
-reimplementing backoff a second time):
+**Persisting** conditions can stay true across many scrapes and use the
+open/resolve dedup dance below. **Edge-triggered** (`price_drop_pct`) is
+only ever "true" on the exact scrape a qualifying drop happens — it can't
+meaningfully be "still true" next scrape unless a brand new drop occurs
+then too, so it self-resolves immediately (`resolved_at == triggered_at`)
+and skips the open/resolve dance; cooldown alone guards against repeats.
 
-- **email** — SMTP via `aiosmtplib`, pointed at the local Mailhog service
-  by default (`SMTP_HOST=mailhog`, no real email needed for dev/tests). For
-  real delivery, point it at Gmail (`SMTP_HOST=smtp.gmail.com`,
-  `SMTP_PORT=587`, `SMTP_USE_TLS=true`, an app-password in
-  `SMTP_USERNAME`/`SMTP_PASSWORD`) or any other SMTP provider.
-- **webhook** — a JSON `POST` to `destination` via `httpx`.
+### Alert delivery
+
+Three delivery paths, all going through `shared/notifiers.py`, which
+retries transient failures with the *same* backoff module the scraper's
+own retries use (`shared/retry.py` — `compute_backoff_delay`, moved there
+specifically so notifiers could reuse it instead of reimplementing
+backoff):
+
+- **email** (`channel: "email"`) — SMTP via `aiosmtplib`, pointed at the
+  local Mailhog service by default (`SMTP_HOST=mailhog`, no real email
+  needed for dev/tests). For real delivery, point it at Gmail
+  (`SMTP_HOST=smtp.gmail.com`, `SMTP_PORT=587`, `SMTP_USE_TLS=true`, an
+  app-password in `SMTP_USERNAME`/`SMTP_PASSWORD`) or any other SMTP
+  provider.
+- **webhook** (`channel: "webhook"`) — a JSON `POST` to `destination` via
+  `httpx`. The full structured payload (`rule_type`, `product_name`,
+  `product_url`, `trigger_price`, `competitor_price`, ...) goes out as-is —
+  suited to something that parses JSON, e.g. your own service.
+- **Discord webhook** — also `channel: "webhook"`, `destination` set to
+  your Discord webhook URL. `shared/notifiers.py` detects URLs containing
+  `discord.com/api/webhooks` automatically (no separate channel value
+  needed) and POSTs Discord's required `{"content": "..."}` shape instead
+  of the generic payload. The `content` string is the *same*
+  human-readable message used for the email body — product name, what
+  triggered, price change, and a link to the product page — built once in
+  `shared/alerts.py::_deliver`, not reimplemented per channel.
+
+  To try it: paste your real webhook URL into `DISCORD_WEBHOOK_URL` in
+  your own `.env` (never commit a real value — `.env.example` only has a
+  placeholder), then create an `AlertRule` with `channel: "webhook"` and
+  that URL as `destination`.
 
 ### Dedup strategy
 
 The full reasoning lives as a docstring at the top of `shared/alerts.py` —
 worth reading directly if you're changing this logic — but the short
-version:
+version, for the three **persisting** rule types:
 
 An `AlertEvent` is **open** while `resolved_at IS NULL`. On every
 evaluation run, for each rule, the condition is recomputed fresh from
@@ -167,9 +198,15 @@ happens:
    **material** changed do we close the old event and open a new one:
    - `undercut`: a *different* competitor is now cheapest, OR the undercut
      gap moved by more than `ALERT_MATERIAL_CHANGE_PCT` (default 5%).
-   - `price_below`: the trigger price moved by more than
-     `ALERT_MATERIAL_CHANGE_PCT` since the open event's price.
-   - `back_in_stock`: never reaches case 4 at all — see below.
+   - `price_below`: the price moved more than `ALERT_MATERIAL_CHANGE_PCT`
+     **further below the threshold** since the open event — measured as
+     percent change in `(threshold − price)`, not in the raw price. A
+     threshold of 1000 going 990 → 980 is a tiny ~1% raw move, but the gap
+     below threshold *doubles* (10 → 20) — material, and correctly so:
+     "further below" is what the user actually cares about, not the raw
+     percentage.
+   - `back_in_stock`: never fires again here while continuously in stock
+     — see below, this is what stops it from re-notifying every scrape.
 
 **Cooldown** (`ALERT_COOLDOWN_MINUTES`, default 60) is a second,
 independent guard checked *before* any mutation in cases 3 and 4: even a
@@ -180,12 +217,25 @@ that oscillates several times in a few minutes — each swing might be
 cooldown blocks a would-be re-trigger, the existing open event (if any) is
 left completely untouched, to be re-evaluated next run.
 
-**`back_in_stock`** is different in kind from the other two: it's an
-edge-triggered instant (the flip itself), not a condition you can
-meaningfully re-check "does it still hold" on later. Each firing creates an
-`AlertEvent` that's immediately self-resolved (`resolved_at == triggered_at`)
-— there's no persisting state to dedup against, just repeat *flips*, which
-cooldown alone guards against.
+**`back_in_stock`** fits the same four-case shape as `undercut`/`price_below`
+— unlike an earlier version of this rule, which fired once and immediately
+self-resolved. Now "holds" tracks whether the product is *currently* in
+stock, and the open event represents "there is a live in-stock streak the
+user has been told about." It resolves the moment the product goes out of
+stock again (case 2) — so the *next* restock after that is a genuinely
+fresh `AlertEvent` (case 3), not a reopen of the old one. The one wrinkle:
+a *fresh* trigger (case 3, no open event) only fires on a real observed
+flip (previous snapshot recorded out-of-stock, latest in-stock) —
+otherwise the very first snapshot ever taken while in stock would look
+like a "restock" with nothing to compare against.
+
+**`price_drop_pct`** doesn't participate in any of this — it's
+edge-triggered (see above). "A NEW drop occurred that is itself larger
+than the threshold — not just the price staying low" falls out for free:
+the condition is defined entirely in terms of the two most recent
+snapshots, so it can only be true again if another qualifying drop
+actually happens; the price merely *staying* low changes nothing, because
+"previous" has moved on to a newer snapshot each time.
 
 ## Shared code
 
@@ -241,11 +291,15 @@ one process — doesn't have two same-named top-level packages colliding.
   mine." Unique on `(product_id, competitor_product_id)`; a CHECK constraint
   blocks a product from competing with itself.
 - **alert_rules** — one row per configured alert (`rule_type`,
-  `threshold_price` for `price_below`, delivery `channel`+`destination`,
-  `is_active`). `rule_type`/`channel` are CHECK-constrained rather than
-  native Postgres enums, matching the rest of this schema's plain-`String`
-  style — avoids the migration ceremony of altering a Postgres enum type
-  later.
+  `threshold_price` for `price_below`, `threshold_pct` for `price_drop_pct`,
+  delivery `channel`+`destination`, `is_active`). `rule_type`/`channel` are
+  CHECK-constrained rather than native Postgres enums, matching the rest of
+  this schema's plain-`String` style — avoids the migration ceremony of
+  altering a Postgres enum type later (this mattered in practice: adding
+  `price_drop_pct` needed a hand-written constraint drop/recreate in the
+  migration either way, since Alembic's autogenerate doesn't detect CHECK
+  constraint *body* changes — but a native enum would have needed the same
+  by-hand treatment plus more).
 - **alert_events** — one row per alert firing/resolution. `resolved_at IS
   NULL` means open; see the dedup strategy above. Indexed on
   `(alert_rule_id, triggered_at desc)`.
@@ -300,7 +354,7 @@ replaced with `fakeredis` for every test via an autouse fixture in
 `tests/conftest.py`. The scraper's Playwright calls are always mocked too — no
 test in this suite makes a real network call.
 
-Last local run: **85 passed, 80.4% coverage** (`--cov-fail-under=70`,
+Last local run: **96 passed, 81.2% coverage** (`--cov-fail-under=70`,
 enforced in CI). What's *not* covered, and why that's an accepted gap
 rather than an oversight:
 
@@ -314,14 +368,18 @@ rather than an oversight:
   in Redis, real 5-attempt exhaustion → DLQ → replay), just not by anything
   `pytest` runs. Worth an integration test with a real `docker compose`
   stack if this becomes CI-gated later; not worth faking here.
-- **`shared/notifiers.py`'s `_send_email`/`_send_webhook`** (~29% of that
+- **`shared/notifiers.py`'s `_send_email`/`_send_webhook`** (~28% of that
   file) — `test_alerts.py` mocks `send_notification` at its outer boundary
   (per the task's "no real SMTP/HTTP in tests" instruction), so the
-  actual `aiosmtplib`/`httpx` calls inside are never exercised by `pytest`.
-  They *are* real-verified: the live end-to-end check for this phase sent
-  genuine SMTP traffic to Mailhog and confirmed the email landed
-  (`GET http://localhost:8025/api/v2/messages`) — same "live-verified,
-  not pytest-verified" situation as the worker loops above.
+  actual `aiosmtplib`/`httpx` calls — including the Discord-vs-generic
+  payload branch in `_send_webhook` — are never exercised by `pytest`.
+  Both paths *are* real-verified, just not by `pytest`: genuine SMTP
+  traffic to Mailhog (confirmed via its API) for email, and a genuine POST
+  to a real Discord webhook (confirmed by `delivery_status="sent"` with no
+  `delivery_error`, and visually in Discord) for the webhook/Discord path.
+  Same "live-verified, not pytest-verified" situation as the worker loops
+  above. Worth a unit test on the Discord-URL-detection branch specifically
+  (pure function, cheap to add) if this file grows more channels later.
 - **`api/app/routers/competitors.py` and `alert_rules.py`** (52%/62%) —
   the core paths (create/list/delete, self-link rejection, duplicate
   rejection, 404s) are tested; some less-interesting branches (e.g. a

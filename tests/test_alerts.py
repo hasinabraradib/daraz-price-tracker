@@ -144,7 +144,10 @@ async def test_price_below_does_not_fire_above_threshold(db_session, mock_notifi
 
 
 @pytest.mark.asyncio
-async def test_back_in_stock_fires_on_flip(db_session, mock_notifications):
+async def test_back_in_stock_fires_on_flip_and_stays_open(db_session, mock_notifications):
+    """Unlike the previous version of this rule (instant self-resolve),
+    back_in_stock is now a persisting condition: the event stays open
+    until the product goes out of stock again."""
     product = await _make_product(db_session, "Mine")
     await _add_snapshot(db_session, product.id, "100.00", in_stock=False)
     await _add_snapshot(db_session, product.id, "100.00", in_stock=True)
@@ -154,9 +157,7 @@ async def test_back_in_stock_fires_on_flip(db_session, mock_notifications):
 
     assert len(events) == 1
     assert events[0].alert_rule_id == rule.id
-    # edge-triggered: self-resolves immediately, no persisting open state
-    assert events[0].resolved_at is not None
-    assert events[0].resolved_at == events[0].triggered_at
+    assert events[0].resolved_at is None
     assert len(mock_notifications) == 1
 
 
@@ -175,16 +176,218 @@ async def test_back_in_stock_does_not_fire_without_a_prior_out_of_stock_snapshot
 
 
 @pytest.mark.asyncio
-async def test_back_in_stock_does_not_fire_when_still_in_stock(db_session, mock_notifications):
+async def test_price_drop_pct_fires_on_qualifying_drop(db_session, mock_notifications):
     product = await _make_product(db_session, "Mine")
-    await _add_snapshot(db_session, product.id, "100.00", in_stock=True)
-    await _add_snapshot(db_session, product.id, "95.00", in_stock=True)
-    await _make_rule(db_session, product.id, "back_in_stock")
+    await _add_snapshot(db_session, product.id, "100.00")
+    rule = await _make_rule(db_session, product.id, "price_drop_pct", threshold_pct=Decimal("10"))
+    await evaluate_alerts(db_session, product.id)  # first-ever snapshot, no "previous" to drop from
+    assert mock_notifications == []
 
+    await _add_snapshot(db_session, product.id, "85.00")  # 15% drop, exceeds 10% threshold
+    events = await evaluate_alerts(db_session, product.id)
+
+    assert len(events) == 1
+    assert events[0].alert_rule_id == rule.id
+    assert events[0].trigger_price == Decimal("85.00")
+    # edge-triggered: self-resolves immediately, no persisting open state
+    assert events[0].resolved_at == events[0].triggered_at
+    assert len(mock_notifications) == 1
+
+
+@pytest.mark.asyncio
+async def test_price_drop_pct_does_not_fire_on_small_drop(db_session, mock_notifications):
+    product = await _make_product(db_session, "Mine")
+    await _add_snapshot(db_session, product.id, "100.00")
+    await _make_rule(db_session, product.id, "price_drop_pct", threshold_pct=Decimal("10"))
+    await evaluate_alerts(db_session, product.id)
+
+    await _add_snapshot(db_session, product.id, "95.00")  # only a 5% drop
     events = await evaluate_alerts(db_session, product.id)
 
     assert events == []
     assert mock_notifications == []
+
+
+@pytest.mark.asyncio
+async def test_price_drop_pct_does_not_fire_on_price_increase(db_session, mock_notifications):
+    product = await _make_product(db_session, "Mine")
+    await _add_snapshot(db_session, product.id, "100.00")
+    await _make_rule(db_session, product.id, "price_drop_pct", threshold_pct=Decimal("10"))
+    await evaluate_alerts(db_session, product.id)
+
+    await _add_snapshot(db_session, product.id, "110.00")
+    events = await evaluate_alerts(db_session, product.id)
+
+    assert events == []
+    assert mock_notifications == []
+
+
+@pytest.mark.asyncio
+async def test_price_drop_pct_price_staying_low_does_not_refire(
+    db_session, mock_notifications, monkeypatch
+):
+    """"Not just the price staying low" (per the task spec): after a
+    qualifying drop, holding steady at the new low price shouldn't refire
+    — only a *new* qualifying drop (vs the immediately prior snapshot)
+    should."""
+    monkeypatch.setattr(settings, "alert_cooldown_minutes", 0)
+
+    product = await _make_product(db_session, "Mine")
+    await _add_snapshot(db_session, product.id, "100.00")
+    await _make_rule(db_session, product.id, "price_drop_pct", threshold_pct=Decimal("10"))
+    await evaluate_alerts(db_session, product.id)
+
+    await _add_snapshot(db_session, product.id, "85.00")  # 15% drop, fires
+    first = await evaluate_alerts(db_session, product.id)
+    assert len(first) == 1
+
+    await _add_snapshot(db_session, product.id, "85.00")  # flat — no new drop
+    second = await evaluate_alerts(db_session, product.id)
+
+    assert second == []
+    assert len(mock_notifications) == 1
+
+
+@pytest.mark.asyncio
+async def test_price_drop_pct_new_qualifying_drop_fires_again(
+    db_session, mock_notifications, monkeypatch
+):
+    monkeypatch.setattr(settings, "alert_cooldown_minutes", 0)
+
+    product = await _make_product(db_session, "Mine")
+    await _add_snapshot(db_session, product.id, "100.00")
+    await _make_rule(db_session, product.id, "price_drop_pct", threshold_pct=Decimal("10"))
+    await evaluate_alerts(db_session, product.id)
+
+    await _add_snapshot(db_session, product.id, "85.00")  # 15% drop
+    first = await evaluate_alerts(db_session, product.id)
+    assert len(first) == 1
+
+    await _add_snapshot(db_session, product.id, "70.00")  # another >10% drop
+    second = await evaluate_alerts(db_session, product.id)
+
+    assert len(second) == 1
+    assert second[0].id != first[0].id  # a genuinely new event
+    assert len(mock_notifications) == 2
+
+
+@pytest.mark.asyncio
+async def test_price_drop_pct_cooldown_respected(db_session, mock_notifications):
+    product = await _make_product(db_session, "Mine")
+    await _add_snapshot(db_session, product.id, "100.00")
+    await _make_rule(db_session, product.id, "price_drop_pct", threshold_pct=Decimal("10"))
+    await evaluate_alerts(db_session, product.id)
+
+    await _add_snapshot(db_session, product.id, "85.00")  # fires
+    first = await evaluate_alerts(db_session, product.id)
+    assert len(first) == 1
+
+    # another qualifying drop, but within the default 60-minute cooldown
+    await _add_snapshot(db_session, product.id, "70.00")
+    second = await evaluate_alerts(db_session, product.id)
+
+    assert second == []
+    assert len(mock_notifications) == 1
+
+
+# ---- back_in_stock (persisting condition: resolves on next out-of-stock) ----
+
+
+@pytest.mark.asyncio
+async def test_back_in_stock_does_not_refire_while_continuously_in_stock(
+    db_session, mock_notifications
+):
+    product = await _make_product(db_session, "Mine")
+    await _add_snapshot(db_session, product.id, "100.00", in_stock=False)
+    await _add_snapshot(db_session, product.id, "100.00", in_stock=True)
+    await _make_rule(db_session, product.id, "back_in_stock")
+
+    first = await evaluate_alerts(db_session, product.id)
+    assert len(first) == 1
+    assert len(mock_notifications) == 1
+
+    # still in stock on the next scrape — no new event, no new notification
+    await _add_snapshot(db_session, product.id, "95.00", in_stock=True)
+    second = await evaluate_alerts(db_session, product.id)
+
+    assert second == []
+    assert len(mock_notifications) == 1
+
+    open_events = (
+        await db_session.execute(select(AlertEvent).where(AlertEvent.resolved_at.is_(None)))
+    ).scalars().all()
+    assert len(open_events) == 1  # the original event, still open, untouched
+
+
+@pytest.mark.asyncio
+async def test_back_in_stock_resolves_when_it_goes_out_of_stock_again(
+    db_session, mock_notifications
+):
+    product = await _make_product(db_session, "Mine")
+    await _add_snapshot(db_session, product.id, "100.00", in_stock=False)
+    await _add_snapshot(db_session, product.id, "100.00", in_stock=True)
+    await _make_rule(db_session, product.id, "back_in_stock")
+
+    first = await evaluate_alerts(db_session, product.id)
+    assert first[0].resolved_at is None
+    assert len(mock_notifications) == 1
+
+    await _add_snapshot(db_session, product.id, "100.00", in_stock=False)
+    second = await evaluate_alerts(db_session, product.id)
+
+    assert len(second) == 1
+    assert second[0].id == first[0].id
+    assert second[0].resolved_at is not None
+    assert len(mock_notifications) == 2  # original alert + resolution notice
+
+
+@pytest.mark.asyncio
+async def test_back_in_stock_retriggers_after_going_out_of_stock_and_back(
+    db_session, mock_notifications, monkeypatch
+):
+    monkeypatch.setattr(settings, "alert_cooldown_minutes", 0)
+
+    product = await _make_product(db_session, "Mine")
+    await _add_snapshot(db_session, product.id, "100.00", in_stock=False)
+    await _add_snapshot(db_session, product.id, "100.00", in_stock=True)
+    await _make_rule(db_session, product.id, "back_in_stock")
+
+    first = await evaluate_alerts(db_session, product.id)
+    first_event_id = first[0].id
+
+    await _add_snapshot(db_session, product.id, "100.00", in_stock=False)  # resolves it
+    resolved = await evaluate_alerts(db_session, product.id)
+    assert resolved[0].id == first_event_id
+    assert resolved[0].resolved_at is not None
+
+    await _add_snapshot(db_session, product.id, "100.00", in_stock=True)  # restocked again
+    retriggered = await evaluate_alerts(db_session, product.id)
+
+    assert len(retriggered) == 1
+    assert retriggered[0].id != first_event_id  # a genuinely new row
+    assert retriggered[0].resolved_at is None
+    assert len(mock_notifications) == 3  # alert, resolution, fresh alert
+
+
+@pytest.mark.asyncio
+async def test_back_in_stock_cooldown_respected_on_retrigger(db_session, mock_notifications):
+    product = await _make_product(db_session, "Mine")
+    await _add_snapshot(db_session, product.id, "100.00", in_stock=False)
+    await _add_snapshot(db_session, product.id, "100.00", in_stock=True)
+    await _make_rule(db_session, product.id, "back_in_stock")
+
+    await evaluate_alerts(db_session, product.id)
+    assert len(mock_notifications) == 1
+
+    await _add_snapshot(db_session, product.id, "100.00", in_stock=False)
+    await evaluate_alerts(db_session, product.id)  # resolves, no cooldown gate on resolution
+
+    # restocked again, but within the default 60-minute cooldown
+    await _add_snapshot(db_session, product.id, "100.00", in_stock=True)
+    events = await evaluate_alerts(db_session, product.id)
+
+    assert events == []
+    assert len(mock_notifications) == 2  # alert + resolution only, no third
 
 
 # ---- dedup ----
@@ -347,6 +550,52 @@ async def test_cooldown_suppresses_even_a_material_change(db_session, mock_notif
     ).scalars().all()
     assert len(open_events) == 1
     assert open_events[0].competitor_product_id == competitor_a.id
+
+
+@pytest.mark.asyncio
+async def test_price_below_dedup_uses_gap_from_threshold_not_raw_price_change(
+    db_session, mock_notifications, monkeypatch
+):
+    """A price move that's tiny in raw percent terms can still be material
+    if it doubles how far under the threshold we are — this is what
+    distinguishes price_below's dedup from a naive "did trigger_price
+    change by more than 5%" check. threshold=1000, price 990 -> 980 is
+    only ~1% raw movement, but the gap-below-threshold doubles (10 -> 20),
+    a 100% change — material."""
+    monkeypatch.setattr(settings, "alert_cooldown_minutes", 0)
+
+    product = await _make_product(db_session, "Mine")
+    await _add_snapshot(db_session, product.id, "990.00")
+    await _make_rule(db_session, product.id, "price_below", threshold_price=Decimal("1000.00"))
+    first = await evaluate_alerts(db_session, product.id)
+    assert len(first) == 1
+
+    await _add_snapshot(db_session, product.id, "980.00")
+    second = await evaluate_alerts(db_session, product.id)
+
+    assert len(second) == 2  # old resolved + new opened
+    opened = [e for e in second if e.resolved_at is None][0]
+    assert opened.trigger_price == Decimal("980.00")
+    assert len(mock_notifications) == 2
+
+
+@pytest.mark.asyncio
+async def test_price_below_dedup_small_gap_change_does_not_fire(
+    db_session, mock_notifications, monkeypatch
+):
+    monkeypatch.setattr(settings, "alert_cooldown_minutes", 0)
+
+    product = await _make_product(db_session, "Mine")
+    await _add_snapshot(db_session, product.id, "990.00")  # gap = 10
+    await _make_rule(db_session, product.id, "price_below", threshold_price=Decimal("1000.00"))
+    await evaluate_alerts(db_session, product.id)
+    assert len(mock_notifications) == 1
+
+    await _add_snapshot(db_session, product.id, "989.70")  # gap = 10.3, a 3% gap change
+    second = await evaluate_alerts(db_session, product.id)
+
+    assert second == []
+    assert len(mock_notifications) == 1
 
 
 # ---- resolution ----

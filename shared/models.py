@@ -121,7 +121,7 @@ class AlertRule(Base):
     __tablename__ = "alert_rules"
     __table_args__ = (
         CheckConstraint(
-            "rule_type IN ('undercut', 'price_below', 'back_in_stock')",
+            "rule_type IN ('undercut', 'price_below', 'price_drop_pct', 'back_in_stock')",
             name="ck_alert_rules_rule_type",
         ),
         CheckConstraint("channel IN ('email', 'webhook')", name="ck_alert_rules_channel"),
@@ -135,6 +135,9 @@ class AlertRule(Base):
     # only meaningful (and required, enforced at the API layer) for
     # rule_type="price_below"
     threshold_price: Mapped[float | None] = mapped_column(Numeric(12, 2), nullable=True)
+    # only meaningful (and required, enforced at the API layer) for
+    # rule_type="price_drop_pct" — a percentage, e.g. 10 means "10%"
+    threshold_pct: Mapped[float | None] = mapped_column(Numeric(6, 2), nullable=True)
     channel: Mapped[str] = mapped_column(String(16), nullable=False)
     destination: Mapped[str] = mapped_column(String(512), nullable=False)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)

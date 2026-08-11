@@ -28,6 +28,13 @@ class Settings(BaseSettings):
     smtp_use_tls: bool = False
     alert_from_email: str = "alerts@daraz-price-tracker.local"
 
+    # Convenience slot for your real Discord webhook URL (paste it into
+    # .env yourself — never commit a real value). Not read by the notifier
+    # itself: an AlertRule's own `destination` is what's actually POSTed
+    # to; this is just a config-level place to keep the secret for
+    # scripts/tests that need to create a rule pointing at it.
+    discord_webhook_url: str | None = None
+
     # alert dedup — see shared/alerts.py's module docstring for the full
     # strategy this backs
     alert_material_change_pct: float = 5.0

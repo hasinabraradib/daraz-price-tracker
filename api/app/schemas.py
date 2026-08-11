@@ -153,8 +153,9 @@ class ComparisonResponse(BaseModel):
 
 
 class AlertRuleCreate(BaseModel):
-    rule_type: Literal["undercut", "price_below", "back_in_stock"]
+    rule_type: Literal["undercut", "price_below", "price_drop_pct", "back_in_stock"]
     threshold_price: Decimal | None = None
+    threshold_pct: Decimal | None = None
     channel: Literal["email", "webhook"]
     destination: str
 
@@ -162,6 +163,10 @@ class AlertRuleCreate(BaseModel):
     def _validate(self) -> "AlertRuleCreate":
         if self.rule_type == "price_below" and self.threshold_price is None:
             raise ValueError("threshold_price is required for price_below rules")
+        if self.rule_type == "price_drop_pct" and self.threshold_pct is None:
+            raise ValueError("threshold_pct is required for price_drop_pct rules")
+        if self.rule_type == "price_drop_pct" and not (0 < self.threshold_pct <= 100):
+            raise ValueError("threshold_pct must be between 0 and 100")
         if self.channel == "webhook" and not self.destination.startswith(("http://", "https://")):
             raise ValueError("webhook destination must be an http(s) URL")
         if self.channel == "email" and "@" not in self.destination:
@@ -176,6 +181,7 @@ class AlertRuleRead(BaseModel):
     product_id: int
     rule_type: str
     threshold_price: Decimal | None
+    threshold_pct: Decimal | None
     channel: str
     destination: str
     is_active: bool
