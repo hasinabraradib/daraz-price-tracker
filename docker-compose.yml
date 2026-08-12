@@ -21,6 +21,8 @@ services:
     build:
       context: .
       dockerfile: worker/Dockerfile
+    ports:
+      - "9100:9100"  # Prometheus metrics — worker has no other HTTP server
     volumes:
       - ./worker/worker_app:/code/app
       - ./shared:/code/shared

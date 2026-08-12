@@ -1,0 +1,55 @@
+# Non-secret configuration, shared by the api and worker Deployments and
+# the migrate Job via envFrom. Mirrors shared/config.py's Settings fields
+# (and .env.example for local docker-compose) — every key here is read by
+# the app on startup via pydantic-settings' env var loading.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: price-tracker-config
+  namespace: price-tracker
+data:
+  LOG_LEVEL: "INFO"
+
+  # non-secret half of the Postgres connection — POSTGRES_PASSWORD lives
+  # in secret.yaml. Used directly by the postgres StatefulSet's own
+  # container env, and folded into DATABASE_URL (in the Secret) for the
+  # api/worker/migrate containers.
+  POSTGRES_USER: "daraz"
+  POSTGRES_DB: "daraz_price_tracker"
+
+  # host matches the "redis" headless Service name (redis-statefulset.yaml)
+  REDIS_URL: "redis://redis:6379/0"
+  QUEUE_NAME: "scrape_jobs"
+
+  # worker poll intervals (seconds) — see worker_app/main.py's
+  # worker_loop/promoter_loop/metrics_refresh_loop
+  DEQUEUE_TIMEOUT_SECONDS: "5"
+  PROMOTE_INTERVAL_SECONDS: "2"
+  GAUGE_REFRESH_INTERVAL_SECONDS: "5"
+
+  # minimum seconds between scrape requests made by the worker
+  POLITE_DELAY_SECONDS: "3"
+
+  # retry/backoff for failed scrape jobs (full jitter — see shared/retry.py)
+  RETRY_BASE_DELAY_SECONDS: "5"
+  RETRY_BACKOFF_FACTOR: "2"
+  RETRY_MAX_DELAY_SECONDS: "600"
+  RETRY_MAX_ATTEMPTS: "5"
+
+  # alert dedup — see shared/alerts.py's module docstring
+  ALERT_MATERIAL_CHANGE_PCT: "5"
+  ALERT_COOLDOWN_MINUTES: "60"
+
+  # SMTP host/port/tls are not secret by themselves; SMTP_USERNAME/
+  # SMTP_PASSWORD (the actual credential) live in secret.yaml. Mailhog
+  # itself is not deployed to this cluster (docker-compose only, for local
+  # dev) — point this at a real SMTP host, or add a Mailhog
+  # Deployment+Service under this namespace, before email-channel alerts
+  # will actually deliver here.
+  SMTP_HOST: "mailhog"
+  SMTP_PORT: "1025"
+  SMTP_USE_TLS: "false"
+  ALERT_FROM_EMAIL: "alerts@daraz-price-tracker.local"
+
+  API_HOST: "0.0.0.0"
+  API_PORT: "8000"

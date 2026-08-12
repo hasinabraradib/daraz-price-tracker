@@ -1,13 +1,22 @@
 import asyncio
 import json
 import logging
+import signal
 import sys
 import time
 from datetime import datetime, timezone
 
+from prometheus_client import start_http_server
+
 from shared.alerts import evaluate_alerts
 from shared.config import settings
 from shared.database import async_session_factory
+from shared.metrics import (
+    JOBS_DEAD_LETTERED_TOTAL,
+    SCRAPE_ATTEMPTS_TOTAL,
+    SCRAPE_DURATION_SECONDS,
+    refresh_gauges,
+)
 from shared.models import PriceSnapshot, ScrapeAttempt
 
 from .queue import dead_letter, dequeue_job, promote_due_jobs, schedule_retry
@@ -20,11 +29,24 @@ from .scraper import (
     scrape_product,
 )
 
-DEQUEUE_TIMEOUT_SECONDS = 5
-PROMOTE_INTERVAL_SECONDS = 2
+METRICS_PORT = 9100
 
-logging.basicConfig(level=logging.INFO, stream=sys.stdout, format="%(message)s")
+logging.basicConfig(
+    level=getattr(logging, settings.log_level.upper(), logging.INFO),
+    stream=sys.stdout,
+    format="%(message)s",
+)
 logger = logging.getLogger("worker")
+
+# Set on SIGTERM (see run()). Kubernetes sends SIGTERM before deleting a
+# pod, then SIGKILL after terminationGracePeriodSeconds if the process is
+# still alive. Without trapping it, Python's default disposition kills the
+# process immediately — including mid-scrape, abandoning the job with no
+# record of what happened to it (dequeue_job doesn't leave an in-flight
+# copy anywhere). Trapping SIGTERM lets each loop finish its *current*
+# iteration (i.e. let process_job() return) before exiting, so a grace
+# period long enough for one scrape actually protects that scrape.
+shutdown_event = asyncio.Event()
 
 
 def log_event(**fields) -> None:
@@ -59,6 +81,9 @@ async def _handle_success(job: dict, result: ScrapedProduct, started: float) -> 
     product_id = job["product_id"]
     attempt_number = job["attempt"]
     duration_ms = int((time.monotonic() - started) * 1000)
+
+    SCRAPE_ATTEMPTS_TOTAL.labels(outcome="success", error_type="").inc()
+    SCRAPE_DURATION_SECONDS.observe(duration_ms / 1000)
 
     async with async_session_factory() as session:
         session.add(
@@ -106,6 +131,9 @@ async def _handle_failure(job: dict, exc: ScrapeError, started: float) -> None:
     error_type = type(exc).__name__
     error_message = str(exc)
 
+    SCRAPE_ATTEMPTS_TOTAL.labels(outcome="failure", error_type=error_type).inc()
+    SCRAPE_DURATION_SECONDS.observe(duration_ms / 1000)
+
     await _record_attempt(
         product_id,
         success=False,
@@ -146,6 +174,7 @@ async def _handle_failure(job: dict, exc: ScrapeError, started: float) -> None:
 
     if reason is not None:
         await dead_letter(job, final_error_type=error_type, final_error_message=error_message)
+        JOBS_DEAD_LETTERED_TOTAL.labels(reason=reason).inc()
         log_event(
             job_id=job_id,
             product_id=product_id,
@@ -184,6 +213,9 @@ async def _handle_unclassified_failure(job: dict, exc: Exception, started: float
     error_type = f"Unclassified.{type(exc).__name__}"
     error_message = repr(exc)
 
+    SCRAPE_ATTEMPTS_TOTAL.labels(outcome="failure", error_type=error_type).inc()
+    SCRAPE_DURATION_SECONDS.observe(duration_ms / 1000)
+
     await _record_attempt(
         product_id,
         success=False,
@@ -205,6 +237,7 @@ async def _handle_unclassified_failure(job: dict, exc: Exception, started: float
     job["attempt_history"] = history
 
     await dead_letter(job, final_error_type=error_type, final_error_message=error_message)
+    JOBS_DEAD_LETTERED_TOTAL.labels(reason="unclassified_error").inc()
     log_event(
         job_id=job_id,
         product_id=product_id,
@@ -231,8 +264,8 @@ async def process_job(job: dict) -> None:
 
 
 async def worker_loop() -> None:
-    while True:
-        job = await dequeue_job(timeout=DEQUEUE_TIMEOUT_SECONDS)
+    while not shutdown_event.is_set():
+        job = await dequeue_job(timeout=settings.dequeue_timeout_seconds)
         if job is None:
             continue
         await process_job(job)
@@ -242,16 +275,31 @@ async def promoter_loop() -> None:
     """Periodically move delayed jobs whose backoff has elapsed back onto
     the main queue. Polling, not sleeping out the backoff itself — the
     delay lives in Redis so it survives worker restarts."""
-    while True:
+    while not shutdown_event.is_set():
         moved = await promote_due_jobs()
         if moved:
             log_event(event="promoted_delayed_jobs", count=moved)
-        await asyncio.sleep(PROMOTE_INTERVAL_SECONDS)
+        await asyncio.sleep(settings.promote_interval_seconds)
+
+
+async def metrics_refresh_loop() -> None:
+    """The worker has no per-request hook to refresh gauges at exact scrape
+    time the way the API's GET /metrics handler does (see
+    shared/metrics.py's module docstring for the full reasoning) —
+    prometheus_client's start_http_server just serves whatever the gauges
+    were last set to. So we refresh them here on a timer instead."""
+    while not shutdown_event.is_set():
+        await refresh_gauges()
+        await asyncio.sleep(settings.gauge_refresh_interval_seconds)
 
 
 async def run() -> None:
-    log_event(event="worker_started")
-    await asyncio.gather(worker_loop(), promoter_loop())
+    start_http_server(METRICS_PORT)
+    loop = asyncio.get_running_loop()
+    loop.add_signal_handler(signal.SIGTERM, shutdown_event.set)
+    log_event(event="worker_started", metrics_port=METRICS_PORT)
+    await asyncio.gather(worker_loop(), promoter_loop(), metrics_refresh_loop())
+    log_event(event="worker_shutdown_complete")
 
 
 if __name__ == "__main__":

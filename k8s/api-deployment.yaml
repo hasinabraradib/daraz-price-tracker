@@ -1,0 +1,87 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+  namespace: price-tracker
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: api
+  template:
+    metadata:
+      labels:
+        app: api
+    spec:
+      serviceAccountName: price-tracker-api
+      initContainers:
+        # Blocks pod startup until the migrate Job has completed, so no
+        # api pod ever serves a request against an unmigrated schema.
+        # Polls the Job's own status (via the RBAC role in rbac.yaml)
+        # rather than re-running/duplicating the migration itself.
+        - name: wait-for-migrations
+          image: bitnami/kubectl:latest
+          command:
+            - sh
+            - -c
+            - |
+              until [ "$(kubectl get job migrate -n price-tracker -o jsonpath='{.status.succeeded}')" = "1" ]; do
+                echo "waiting for migrate job to complete..."
+                sleep 3
+              done
+      containers:
+        - name: api
+          image: daraz-price-tracker-api:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8000
+          envFrom:
+            - configMapRef:
+                name: price-tracker-config
+            - secretRef:
+                name: price-tracker-secrets
+          readinessProbe:
+            # Hits the DB (see api/app/main.py) — a pod that can't reach
+            # Postgres shouldn't receive traffic, even though the process
+            # itself is up.
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+          livenessProbe:
+            # Deliberately does NOT touch the database (see /live in
+            # api/app/main.py). Liveness failures get the pod killed and
+            # restarted; if this probe checked the DB, a single Postgres
+            # blip would make every api pod fail liveness at once and
+            # Kubernetes would kill all of them simultaneously — a restart
+            # storm that doesn't fix the outage and adds a total-downtime
+            # window on top of it. Readiness already takes DB-less pods
+            # out of rotation without killing anything.
+            httpGet:
+              path: /live
+              port: 8000
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "256Mi"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: api
+  namespace: price-tracker
+spec:
+  type: ClusterIP
+  selector:
+    app: api
+  ports:
+    - port: 8000
+      targetPort: 8000

@@ -1,7 +1,7 @@
 # daraz-price-tracker
 
 [![CI](https://github.com/hasinabraradib/daraz-price-tracker/actions/workflows/ci.yml/badge.svg)](https://github.com/hasinabraradib/daraz-price-tracker/actions/workflows/ci.yml)
-![coverage](https://img.shields.io/badge/coverage-81.2%25-brightgreen)
+![coverage](https://img.shields.io/badge/coverage-84.4%25-brightgreen)
 
 > The CI badge above will 404 until this repo exists at
 > `github.com/hasinabraradib/daraz-price-tracker` and the workflow has run
@@ -26,7 +26,11 @@ for shoppers watching a price.
 - Alembic for migrations
 - Mailhog (local SMTP catcher — dev/test email alerts land here, not a real inbox)
 - Discord webhooks (auto-detected — see **Alert delivery** below)
-- Docker Compose for local dev
+- Prometheus client metrics (`GET /metrics` on the API, `:9100/metrics` on
+  the worker — see **Metrics** below; no Prometheus *server* scraping them
+  yet, this is pure application instrumentation)
+- Docker Compose for local dev, Kubernetes manifests for a local minikube
+  deploy (see **Kubernetes** below)
 
 ## Getting started
 
@@ -37,7 +41,8 @@ docker compose up --build
 
 The API is available at http://localhost:8000. `GET /health` verifies the
 database connection (not faked — it runs a real `SELECT 1`). Mailhog's web
-UI (view alert emails sent in dev) is at http://localhost:8025.
+UI (view alert emails sent in dev) is at http://localhost:8025. Metrics:
+`curl localhost:8000/metrics` (API) and `curl localhost:9100/metrics` (worker).
 
 Migrations aren't applied automatically on container start:
 
@@ -327,6 +332,116 @@ one process — doesn't have two same-named top-level packages colliding.
 | GET    | `/products/{id}/alert-rules`      | List a product's alert rules                           |
 | DELETE | `/products/{id}/alert-rules/{rule_id}` | Delete an alert rule                              |
 | GET    | `/alerts`                         | Recent AlertEvents, filterable by `product_id`/`status` |
+| GET    | `/metrics`                        | Prometheus text-format metrics (see **Metrics** below) |
+
+## Metrics
+
+Pure application instrumentation — no Prometheus server or scrape config
+wired up yet, just the two `/metrics` endpoints themselves, in
+standard Prometheus text exposition format. All definitions live in one
+place, `shared/metrics.py`, imported by both services so they report under
+identical metric names — see that module's docstring for the full
+reasoning behind the gauge-refresh design in particular.
+
+| Metric | Type | Labels | What it's for |
+|--------|------|--------|----------------|
+| `scrape_attempts_total` | Counter | `outcome`, `error_type` | Scrape volume and failure rate, sliceable by error type |
+| `alerts_fired_total` | Counter | `rule_type`, `channel` | How often each alert rule type actually fires (fresh triggers + material re-triggers — not resolutions) |
+| `alert_deliveries_total` | Counter | `channel`, `status` | Notification delivery success/failure rate, by channel |
+| `jobs_enqueued_total` | Counter | — | Scrape jobs pushed onto the queue |
+| `jobs_dead_lettered_total` | Counter | `reason` | Jobs that exhausted retries or failed terminally, by why |
+| `queue_depth` | Gauge | — | Current main scrape queue length |
+| `delayed_queue_depth` | Gauge | — | Jobs currently waiting out a retry backoff |
+| `dead_letter_depth` | Gauge | — | Jobs currently in the dead letter queue |
+| `products_tracked_total` | Gauge | `is_active` | Tracked products, active vs. inactive |
+| `scrape_duration_seconds` | Histogram | — | How long a scrape attempt takes (buckets tuned 1-30s — Playwright launches a real browser, this is seconds not milliseconds) |
+| `alert_delivery_duration_seconds` | Histogram | — | How long notification delivery takes, retries included |
+
+**Counters and histograms** are incremented/observed inline, exactly where
+the thing they measure happens — `worker_app/main.py` (scrapes),
+`shared/alerts.py` (alert firing), `shared/notifiers.py` (deliveries),
+`shared/queue.py` (enqueue). Standard stuff.
+
+**Gauges are different in kind**, and it's worth knowing why before
+changing them. They represent state that already lives somewhere else —
+Redis list/zset/hash lengths, a Postgres row count — not something this
+process accumulates. Setting them "on write" (+1 per enqueue, -1 per
+dequeue) would mean re-deriving Redis's own state by tracking every
+mutation perfectly, across however many processes are running, with no way
+to self-heal from a missed decrement (a crash mid-job, a manually
+`redis-cli`-poked queue, a replayed dead letter). Instead they're
+refreshed by querying Redis/Postgres directly, fresh, every time metrics
+are scraped (`shared/metrics.py::refresh_gauges`):
+
+- The **API**'s `GET /metrics` handler is `async def` and `await`s
+  `refresh_gauges()` directly — refreshed at *exactly* scrape time, every
+  time.
+- The **worker** has no HTTP server of its own to hang a per-request hook
+  off — `prometheus_client.start_http_server` runs a plain background
+  thread with no async entry point. So `worker_app/main.py`'s
+  `metrics_refresh_loop` calls `refresh_gauges()` on a timer instead
+  (every `GAUGE_REFRESH_INTERVAL_SECONDS`, default 5s) and the HTTP server
+  just serves whatever was last set. A small, deliberate, documented gap
+  from "exact scrape time" — a real Prometheus server polls every 15-30s
+  anyway, so a value that's at most 5s stale isn't meaningfully different
+  from a fresh one.
+
+We considered a genuine custom `Collector` (registers so `collect()` runs
+automatically on every scrape — the textbook-correct pattern here) and
+didn't use it: `collect()` is synchronous in prometheus_client, and every
+query it'd need is async in this codebase (`redis.asyncio`, async
+SQLAlchemy). Bridging that means either a second set of sync
+clients/drivers just for metrics, or nesting an event loop inside one
+that's already running — which breaks specifically inside FastAPI's
+request handler. Plain gauges refreshed from an already-async context, as
+above, gets the same "not stale" property without either problem.
+
+## Kubernetes
+
+Plain YAML manifests under `k8s/` — no Helm, no Kustomize — deploy the
+same stack (Postgres, Redis, the migration, the api, the worker) to a
+local minikube cluster. Full deploy order, secret handling, and common
+`kubectl` commands are in [`k8s/README.md`](k8s/README.md); the short
+version:
+
+```bash
+minikube start --cpus=4 --memory=6000mb
+docker compose build api worker
+minikube image load daraz-price-tracker-api:latest
+minikube image load daraz-price-tracker-worker:latest
+
+kubectl apply -f k8s/namespace.yaml -f k8s/rbac.yaml
+kubectl apply -f k8s/configmap.yaml -f k8s/secret.yaml
+kubectl apply -f k8s/postgres-statefulset.yaml -f k8s/redis-statefulset.yaml
+kubectl apply -f k8s/migrate-job.yaml
+kubectl apply -f k8s/api-deployment.yaml -f k8s/worker-deployment.yaml
+
+kubectl get all -n price-tracker
+kubectl port-forward -n price-tracker svc/api 8000:8000
+```
+
+Notable design points (each has a longer comment at its source):
+
+- **Postgres and Redis are StatefulSets** with `volumeClaimTemplates`
+  (5Gi / 1Gi) and headless Services (`clusterIP: None`) — a StatefulSet
+  needs one to give its pod(s) a stable per-pod DNS identity instead of
+  being load-balanced behind a single cluster IP.
+- **Migrations run as a one-shot Job**, not inside the api Deployment's
+  own startup — `alembic upgrade head` must run exactly once per rollout,
+  not once per replica racing the others.
+- **The api Deployment has two probes with different jobs**: readiness on
+  `/health` (checks the DB — an unreachable-DB pod shouldn't get traffic)
+  and liveness on `/live` (deliberately DB-free — a Postgres blip
+  shouldn't make Kubernetes kill every api pod at once).
+- **The worker Deployment has no readiness probe** — it pulls jobs from
+  Redis on its own initiative rather than receiving traffic a Service
+  routes to it, so there's nothing for readiness to gate. Its liveness
+  probe hits its own `:9100/metrics`.
+- **`terminationGracePeriodSeconds: 90` on the worker**, and
+  `worker_app/main.py` now traps `SIGTERM` to stop pulling new jobs and
+  let the in-flight `process_job()` call finish before exiting — Redis has
+  no separate record of an in-flight job, so a hard kill mid-scrape loses
+  that job outright rather than retrying it.
 
 ## Migrations
 
@@ -354,32 +469,36 @@ replaced with `fakeredis` for every test via an autouse fixture in
 `tests/conftest.py`. The scraper's Playwright calls are always mocked too — no
 test in this suite makes a real network call.
 
-Last local run: **96 passed, 81.2% coverage** (`--cov-fail-under=70`,
-enforced in CI). What's *not* covered, and why that's an accepted gap
-rather than an oversight:
+Last local run: **105 passed, 84.4% coverage** (`--cov-fail-under=70`,
+enforced in CI). `shared/metrics.py` and `api/app/routers/metrics.py` are
+both at 100%. What's *not* covered elsewhere, and why that's an accepted
+gap rather than an oversight:
 
-- **`worker_app/main.py`'s `worker_loop`, `promoter_loop`, and `run()`**
-  (~45% of that file) — these are `while True:` loops wrapping the
-  functions that *are* unit-tested (`process_job`, `_handle_failure`,
-  `_handle_success`). Unit-testing an infinite loop means either breaking
-  out of it artificially (tests the harness, not the code) or an
-  integration test that starts a real worker process. These were verified
-  by hand against the live stack (real 404 → terminal, real backoff growth
-  in Redis, real 5-attempt exhaustion → DLQ → replay), just not by anything
-  `pytest` runs. Worth an integration test with a real `docker compose`
-  stack if this becomes CI-gated later; not worth faking here.
-- **`shared/notifiers.py`'s `_send_email`/`_send_webhook`** (~28% of that
-  file) — `test_alerts.py` mocks `send_notification` at its outer boundary
-  (per the task's "no real SMTP/HTTP in tests" instruction), so the
-  actual `aiosmtplib`/`httpx` calls — including the Discord-vs-generic
-  payload branch in `_send_webhook` — are never exercised by `pytest`.
-  Both paths *are* real-verified, just not by `pytest`: genuine SMTP
-  traffic to Mailhog (confirmed via its API) for email, and a genuine POST
-  to a real Discord webhook (confirmed by `delivery_status="sent"` with no
-  `delivery_error`, and visually in Discord) for the webhook/Discord path.
-  Same "live-verified, not pytest-verified" situation as the worker loops
-  above. Worth a unit test on the Discord-URL-detection branch specifically
-  (pure function, cheap to add) if this file grows more channels later.
+- **`worker_app/main.py`'s `worker_loop`, `promoter_loop`,
+  `metrics_refresh_loop`, and `run()`** (this file is at 71%, up from 55%
+  before `test_metrics.py` started exercising `process_job` more directly)
+  — the remaining gap is entirely these `while True:` loops wrapping
+  functions that *are* unit-tested. Unit-testing an infinite loop means
+  either breaking out of it artificially (tests the harness, not the
+  code) or an integration test that starts a real worker process. These
+  were verified by hand against the live stack (real 404 → terminal, real
+  backoff growth in Redis, real 5-attempt exhaustion → DLQ → replay, and —
+  this phase — real counters moving on a real `docker compose` stack),
+  just not by anything `pytest` runs. Worth an integration test with a
+  real stack if this becomes CI-gated later; not worth faking here.
+- **`shared/notifiers.py`** (62%, up from 28% — `test_metrics.py` now
+  exercises `send_notification`'s success/failure/counter-recording paths
+  directly) — what's left uncovered is specifically the real
+  `aiosmtplib`/`httpx` I/O inside `_send_email`/`_send_webhook` (including
+  the Discord-vs-generic payload branch) and the multi-attempt
+  retry-with-backoff loop in `_send_with_retries`, none of which `pytest`
+  exercises end-to-end per the task's "no real SMTP/HTTP in tests"
+  instruction. All of it *is* real-verified, just not by `pytest`: genuine
+  SMTP traffic to Mailhog (confirmed via its API) for email, and a genuine
+  POST to a real Discord webhook (confirmed by `delivery_status="sent"`
+  with no `delivery_error`, and visually in Discord) for the
+  webhook/Discord path. Same "live-verified, not pytest-verified"
+  situation as the worker loops above.
 - **`api/app/routers/competitors.py` and `alert_rules.py`** (52%/62%) —
   the core paths (create/list/delete, self-link rejection, duplicate
   rejection, 404s) are tested; some less-interesting branches (e.g. a
@@ -416,6 +535,7 @@ daraz-price-tracker/
 │   │   │   ├── competitors.py  # /products/{id}/competitors, /comparison
 │   │   │   ├── alert_rules.py  # /products/{id}/alert-rules
 │   │   │   ├── alerts.py       # /alerts
+│   │   │   ├── metrics.py      # /metrics
 │   │   │   ├── queue.py        # /queue/depth
 │   │   │   ├── dead_letters.py # /dead-letters endpoints
 │   │   │   └── stats.py        # /stats/scrape-health
@@ -426,7 +546,7 @@ daraz-price-tracker/
 │   └── requirements.txt
 ├── worker/
 │   ├── worker_app/          # importable as `worker_app` — see "Shared code" above
-│   │   ├── main.py          # dequeue loop + promoter loop, retry decisions, alert evaluation
+│   │   ├── main.py          # dequeue/promoter/metrics-refresh loops, retry decisions, alert evaluation
 │   │   ├── scraper.py       # Playwright scraper + exception hierarchy
 │   │   ├── retry.py         # re-exports shared/retry.py
 │   │   └── queue.py         # re-exports shared/queue.py
@@ -440,7 +560,8 @@ daraz-price-tracker/
 │   ├── queue.py              # queue + delayed retry zset + dead letter hash
 │   ├── retry.py              # exponential backoff + full jitter
 │   ├── notifiers.py          # email/webhook delivery, retried via retry.py
-│   └── alerts.py             # rule evaluation + dedup engine
+│   ├── alerts.py             # rule evaluation + dedup engine
+│   └── metrics.py            # Prometheus counters/gauges/histograms, refresh_gauges()
 ├── tests/
 │   ├── conftest.py          # test DB + fakeredis + httpx client fixtures
 │   ├── test_retry.py        # backoff math, jitter, max-attempts
@@ -448,7 +569,19 @@ daraz-price-tracker/
 │   ├── test_queue.py        # enqueue/dequeue/retry/DLQ, via fakeredis
 │   ├── test_url_utils.py    # daraz_url normalization/validation
 │   ├── test_alerts.py       # rule firing, dedup, cooldown, resolution
-│   └── test_api.py          # FastAPI endpoints, via httpx ASGI transport
+│   ├── test_api.py          # FastAPI endpoints, via httpx ASGI transport
+│   └── test_metrics.py      # counters/gauges/histograms, /metrics format
+├── k8s/                      # plain-YAML manifests for a local minikube deploy
+│   ├── namespace.yaml
+│   ├── configmap.yaml
+│   ├── secret.yaml           # placeholders only — see k8s/README.md
+│   ├── rbac.yaml
+│   ├── postgres-statefulset.yaml
+│   ├── redis-statefulset.yaml
+│   ├── migrate-job.yaml
+│   ├── api-deployment.yaml
+│   ├── worker-deployment.yaml
+│   └── README.md             # deploy order, secrets, common kubectl commands
 ├── .github/workflows/ci.yml # test (matrix) -> lint -> build, gha layer cache
 ├── pyproject.toml           # pytest, coverage, ruff config
 ├── requirements-dev.txt

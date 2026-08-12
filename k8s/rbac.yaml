@@ -1,0 +1,35 @@
+# Grants the api Deployment's initContainer permission to read the
+# migrate Job's status (kubectl get job migrate -o jsonpath='{.status...}')
+# so it can wait for migrations to finish before the API starts serving.
+# Scoped to exactly one verb set on one resource type, in this namespace
+# only — the initContainer has no business touching anything else in the
+# cluster.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: price-tracker-api
+  namespace: price-tracker
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: job-status-reader
+  namespace: price-tracker
+rules:
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: price-tracker-api-job-status-reader
+  namespace: price-tracker
+subjects:
+  - kind: ServiceAccount
+    name: price-tracker-api
+    namespace: price-tracker
+roleRef:
+  kind: Role
+  name: job-status-reader
+  apiGroup: rbac.authorization.k8s.io

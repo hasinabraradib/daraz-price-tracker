@@ -1,0 +1,84 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: worker
+  namespace: price-tracker
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: worker
+  template:
+    metadata:
+      labels:
+        app: worker
+    spec:
+      # Default is 30s. A single scrape attempt launches a real headless
+      # Chromium, navigates to a Daraz product page, and waits on its
+      # selectors — comfortably able to take longer than 30s under a slow
+      # page load, and the worker has no separate record of an in-flight
+      # job (see shared/queue.py: dequeue_job pops it, there's no
+      # visibility-timeout copy elsewhere). If Kubernetes SIGKILLs the
+      # process mid-scrape, that job is simply gone — not retried, not
+      # dead-lettered, just lost. worker_app/main.py now traps SIGTERM
+      # (shutdown_event) and lets the current process_job() call finish
+      # before exiting; this grace period has to be at least that long for
+      # the trap to actually protect anything.
+      terminationGracePeriodSeconds: 90
+      containers:
+        - name: worker
+          image: daraz-price-tracker-worker:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: metrics
+              containerPort: 9100
+          envFrom:
+            - configMapRef:
+                name: price-tracker-config
+            - secretRef:
+                name: price-tracker-secrets
+          # No readinessProbe: the worker doesn't serve any traffic that a
+          # Service routes to it for correctness — it pulls jobs from
+          # Redis on its own initiative rather than having jobs pushed to
+          # it over HTTP/gRPC. The only Service pointed at these pods
+          # (below) exists purely so Prometheus can find the metrics port;
+          # a pod that isn't "ready" yet just means a scrape attempt
+          # against it fails once and succeeds a few seconds later once
+          # start_http_server has bound — not a user-facing failure the
+          # way an unready api pod receiving real requests would be.
+          livenessProbe:
+            httpGet:
+              path: /metrics
+              port: 9100
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            timeoutSeconds: 5
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "512Mi"
+            limits:
+              cpu: "1000m"
+              memory: "1Gi"
+---
+# clusterIP: None (headless), same reasoning as postgres/redis's Services:
+# this Service exists only so Prometheus's kubernetes_sd_config can
+# enumerate every worker pod as its own Endpoint and scrape each one's
+# metrics individually. A normal ClusterIP Service would load-balance a
+# single :9100 request across pods round-robin — fine for routing traffic
+# to *one* worker, useless for "give me metrics from every worker pod."
+apiVersion: v1
+kind: Service
+metadata:
+  name: worker-metrics
+  namespace: price-tracker
+  labels:
+    app: worker
+spec:
+  clusterIP: None
+  selector:
+    app: worker
+  ports:
+    - name: metrics
+      port: 9100
+      targetPort: 9100

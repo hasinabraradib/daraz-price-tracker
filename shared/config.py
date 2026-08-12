@@ -8,6 +8,14 @@ class Settings(BaseSettings):
     redis_url: str = "redis://redis:6379/0"
     queue_name: str = "scrape_jobs"
 
+    log_level: str = "INFO"
+
+    # worker poll intervals — see worker_app/main.py's dequeue_job/
+    # promoter_loop/metrics_refresh_loop for what each one paces
+    dequeue_timeout_seconds: float = 5.0
+    promote_interval_seconds: float = 2.0
+    gauge_refresh_interval_seconds: float = 5.0
+
     # minimum seconds between scrape requests made by the worker
     polite_delay_seconds: float = 3.0
 

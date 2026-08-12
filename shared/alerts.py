@@ -95,6 +95,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from shared.config import settings
+from shared.metrics import ALERTS_FIRED_TOTAL
 from shared.models import AlertEvent, AlertRule, PriceSnapshot, Product, ProductCompetitor
 from shared.notifiers import NotifyError, send_notification
 
@@ -389,6 +390,7 @@ async def evaluate_alerts(session: AsyncSession, product_id: int) -> list[AlertE
                 session.add(event)
                 await session.flush()
                 touched.append(event)
+                ALERTS_FIRED_TOTAL.labels(rule_type=rule.rule_type, channel=rule.channel).inc()
                 await _deliver(product, rule, event, resolution=False)
             continue
         else:
@@ -425,6 +427,7 @@ async def evaluate_alerts(session: AsyncSession, product_id: int) -> list[AlertE
         session.add(event)
         await session.flush()
         touched.append(event)
+        ALERTS_FIRED_TOTAL.labels(rule_type=rule.rule_type, channel=rule.channel).inc()
         await _deliver(product, rule, event, resolution=False)
 
     await session.commit()

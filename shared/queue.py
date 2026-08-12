@@ -18,6 +18,12 @@ DEAD_LETTER_KEY = f"{settings.queue_name}:dead"
 
 
 async def enqueue_job(product_id: int, url: str, attempt: int = 1) -> str:
+    # Deferred import: shared.metrics imports queue_depth/etc. from this
+    # module for gauge refresh, so importing shared.metrics back at module
+    # level here would be circular. By the time this function actually
+    # runs, both modules are fully loaded, so the import is safe.
+    from shared.metrics import JOBS_ENQUEUED_TOTAL
+
     job_id = uuid.uuid4().hex
     job = {
         "job_id": job_id,
@@ -28,6 +34,7 @@ async def enqueue_job(product_id: int, url: str, attempt: int = 1) -> str:
         "attempt_history": [],
     }
     await _redis.rpush(settings.queue_name, json.dumps(job))
+    JOBS_ENQUEUED_TOTAL.inc()
     return job_id
 
 

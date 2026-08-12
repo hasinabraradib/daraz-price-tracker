@@ -1,0 +1,53 @@
+# A Job, not a container baked into the api Deployment's startup, because
+# `alembic upgrade head` must run exactly once per rollout, not once per
+# replica. If migrations ran in each api pod's own startup (or
+# initContainer), 2+ replicas starting together would race to run the
+# same migration concurrently — Alembic takes no lock against that by
+# default, and DDL statements racing against each other is how you get a
+# corrupted schema or a crashed pod that just gets restarted into the same
+# race. A single Job runs it once, to completion, before any api pod is
+# allowed to start (see api-deployment.yaml's initContainer).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: migrate
+  namespace: price-tracker
+spec:
+  backoffLimit: 3
+  template:
+    spec:
+      restartPolicy: Never
+      initContainers:
+        - name: wait-for-postgres
+          image: postgres:16-alpine
+          command:
+            - sh
+            - -c
+            - |
+              until pg_isready -h postgres -p 5432 -U "$POSTGRES_USER"; do
+                echo "waiting for postgres..."
+                sleep 2
+              done
+          env:
+            - name: POSTGRES_USER
+              valueFrom:
+                configMapKeyRef:
+                  name: price-tracker-config
+                  key: POSTGRES_USER
+      containers:
+        - name: migrate
+          image: daraz-price-tracker-api:latest
+          imagePullPolicy: IfNotPresent
+          command: ["alembic", "upgrade", "head"]
+          envFrom:
+            - configMapRef:
+                name: price-tracker-config
+            - secretRef:
+                name: price-tracker-secrets
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "256Mi"

@@ -18,12 +18,14 @@ foundation, not something to fix without being asked.
 """
 import asyncio
 import logging
+import time
 from email.message import EmailMessage
 
 import aiosmtplib
 import httpx
 
 from shared.config import settings
+from shared.metrics import ALERT_DELIVERIES_TOTAL, ALERT_DELIVERY_DURATION_SECONDS
 from shared.retry import compute_backoff_delay
 
 logger = logging.getLogger("notifiers")
@@ -76,7 +78,24 @@ async def send_notification(
 ) -> None:
     """Send via `channel` ("email" or "webhook"), retrying transient
     failures with full-jitter backoff. Raises NotifyError if every attempt
-    fails."""
+    fails. Records the delivery outcome/duration metrics around whatever
+    `_send_with_retries` does, so those two concerns stay easy to read
+    separately."""
+    started = time.monotonic()
+    try:
+        await _send_with_retries(channel, destination, subject, body, payload)
+    except NotifyError:
+        ALERT_DELIVERIES_TOTAL.labels(channel=channel, status="failed").inc()
+        raise
+    else:
+        ALERT_DELIVERIES_TOTAL.labels(channel=channel, status="sent").inc()
+    finally:
+        ALERT_DELIVERY_DURATION_SECONDS.observe(time.monotonic() - started)
+
+
+async def _send_with_retries(
+    channel: str, destination: str, subject: str, body: str, payload: dict
+) -> None:
     last_error: Exception | None = None
     for attempt in range(1, NOTIFY_MAX_ATTEMPTS + 1):
         try:
