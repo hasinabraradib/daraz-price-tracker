@@ -1,0 +1,55 @@
+# Datasource provisioning — "as code" instead of clicking "Add data
+# source" in the UI, which wouldn't survive this pod being recreated
+# (Grafana's own state lives on a PVC below, but re-provisioning from a
+# ConfigMap on every start is simpler and self-documenting than relying
+# on that volume never being lost). Grafana reads every *.yml under
+# /etc/grafana/provisioning/datasources on startup.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-datasources
+  namespace: monitoring
+data:
+  datasource.yml: |
+    apiVersion: 1
+    datasources:
+      - name: Prometheus
+        type: prometheus
+        # uid is pinned (rather than left to Grafana's auto-generated
+        # one) so the dashboard JSON ConfigMaps below can reference this
+        # exact datasource by uid and still resolve correctly even if
+        # this ConfigMap gets re-applied.
+        uid: prometheus
+        access: proxy
+        url: http://prometheus.monitoring.svc.cluster.local:9090
+        isDefault: true
+        editable: false
+---
+# Dashboard *provider* config — tells Grafana "load dashboard JSON files
+# from this directory on disk." The actual dashboard JSON lives in
+# grafana-dashboards.yaml and gets mounted into that directory
+# (grafana-deployment.yaml). Grafana re-scans it every
+# updateIntervalSeconds, so editing a dashboard ConfigMap and re-applying
+# picks up the change without a pod restart.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-dashboard-provider
+  namespace: monitoring
+data:
+  provider.yml: |
+    apiVersion: 1
+    providers:
+      - name: price-tracker
+        orgId: 1
+        folder: "Price Tracker"
+        type: file
+        disableDeletion: false
+        # false: dashboards are provisioned from git via this ConfigMap —
+        # an in-UI edit would just be silently discarded on the next
+        # re-scan/restart, which is more confusing than not allowing the
+        # edit in the first place. Change the JSON in git instead.
+        allowUiUpdates: false
+        updateIntervalSeconds: 30
+        options:
+          path: /var/lib/grafana/dashboards

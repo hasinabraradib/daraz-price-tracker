@@ -12,6 +12,13 @@ spec:
     metadata:
       labels:
         app: worker
+      annotations:
+        # Same opt-in mechanism as api-deployment.yaml — see the comment
+        # there. Port differs because the worker's metrics server binds
+        # 9100, not 8000.
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9100"
+        prometheus.io/path: "/metrics"
     spec:
       # Default is 30s. A single scrape attempt launches a real headless
       # Chromium, navigates to a Daraz product page, and waits on its

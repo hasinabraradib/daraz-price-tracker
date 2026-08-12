@@ -12,6 +12,14 @@ spec:
     metadata:
       labels:
         app: api
+      annotations:
+        # Read by monitoring/prometheus's relabel_configs (k8s/monitoring/
+        # prometheus-config.yaml) — this is the opt-in that makes these
+        # pods show up as scrape targets at all, no Prometheus config
+        # change needed to add/remove/scale api pods.
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+        prometheus.io/path: "/metrics"
     spec:
       serviceAccountName: price-tracker-api
       initContainers:

@@ -27,8 +27,9 @@ for shoppers watching a price.
 - Mailhog (local SMTP catcher — dev/test email alerts land here, not a real inbox)
 - Discord webhooks (auto-detected — see **Alert delivery** below)
 - Prometheus client metrics (`GET /metrics` on the API, `:9100/metrics` on
-  the worker — see **Metrics** below; no Prometheus *server* scraping them
-  yet, this is pure application instrumentation)
+  the worker — see **Metrics** below), scraped by a Prometheus server and
+  visualized in Grafana when deployed to Kubernetes (see **Monitoring**
+  under **Kubernetes** below) — docker-compose alone doesn't run either
 - Docker Compose for local dev, Kubernetes manifests for a local minikube
   deploy (see **Kubernetes** below)
 
@@ -336,9 +337,11 @@ one process — doesn't have two same-named top-level packages colliding.
 
 ## Metrics
 
-Pure application instrumentation — no Prometheus server or scrape config
-wired up yet, just the two `/metrics` endpoints themselves, in
-standard Prometheus text exposition format. All definitions live in one
+The two `/metrics` endpoints, in standard Prometheus text exposition
+format — scraped by an actual Prometheus server and visualized in
+Grafana when deployed via `k8s/monitoring/` (see **Kubernetes** below);
+docker-compose alone only exposes the endpoints, nothing scrapes them.
+All definitions live in one
 place, `shared/metrics.py`, imported by both services so they report under
 identical metric names — see that module's docstring for the full
 reasoning behind the gauge-refresh design in particular.
@@ -442,6 +445,45 @@ Notable design points (each has a longer comment at its source):
   let the in-flight `process_job()` call finish before exiting — Redis has
   no separate record of an in-flight job, so a hard kill mid-scrape loses
   that job outright rather than retrying it.
+
+### Monitoring (Prometheus + Grafana)
+
+Deployed into a separate `monitoring` namespace under `k8s/monitoring/`
+— full details in [`k8s/README.md`](k8s/README.md#monitoring-prometheus--grafana).
+Short version:
+
+```bash
+kubectl apply -f k8s/monitoring/namespace.yaml
+kubectl apply -f k8s/monitoring/prometheus-rbac.yaml
+kubectl apply -f k8s/monitoring/prometheus-config.yaml
+kubectl apply -f k8s/monitoring/prometheus-deployment.yaml
+kubectl apply -f k8s/monitoring/grafana-config.yaml
+kubectl apply -f k8s/monitoring/grafana-secret.yaml
+kubectl apply -f k8s/monitoring/grafana-dashboards.yaml
+kubectl apply -f k8s/monitoring/grafana-deployment.yaml
+
+kubectl port-forward -n monitoring svc/prometheus 9090:9090   # http://localhost:9090/targets
+kubectl port-forward -n monitoring svc/grafana 3000:3000      # http://localhost:3000 (admin/changeme)
+```
+
+Prometheus finds api/worker pods via Kubernetes service discovery
+(`kubernetes_sd_configs`, role: pod) — it lists pods across the cluster
+using a ClusterRole and keeps only the ones annotated
+`prometheus.io/scrape: "true"` (already set on both Deployments in
+`k8s/`). No static target list, no Prometheus config change to add a
+target: scale a Deployment up and the new pod is a scrape target within
+one interval (15s).
+
+Two dashboards are provisioned from JSON in `k8s/monitoring/grafana-dashboards.yaml`,
+not clicked together in the UI:
+
+- **Scraper Health** — scrape rate (success vs. failure), success rate %,
+  p50/p95/p99 scrape duration, failures by `error_type`, dead letter
+  queue depth.
+- **Queue & Workers** — main queue depth, delayed retry queue depth,
+  jobs-enqueued-rate vs. jobs-processed-rate (a persistent gap between
+  the two is the under-provisioned signal), alerts fired by rule type,
+  alert delivery success/failure by channel.
 
 ## Migrations
 
@@ -579,8 +621,17 @@ daraz-price-tracker/
 │   ├── postgres-statefulset.yaml
 │   ├── redis-statefulset.yaml
 │   ├── migrate-job.yaml
-│   ├── api-deployment.yaml
-│   ├── worker-deployment.yaml
+│   ├── api-deployment.yaml   # prometheus.io/* scrape annotations included
+│   ├── worker-deployment.yaml # prometheus.io/* scrape annotations included
+│   ├── monitoring/            # separate "monitoring" namespace
+│   │   ├── namespace.yaml
+│   │   ├── prometheus-rbac.yaml
+│   │   ├── prometheus-config.yaml     # scrape + relabel_configs
+│   │   ├── prometheus-deployment.yaml
+│   │   ├── grafana-config.yaml        # datasource + dashboard-provider provisioning
+│   │   ├── grafana-dashboards.yaml    # the 2 dashboards, as JSON
+│   │   ├── grafana-secret.yaml        # placeholders only
+│   │   └── grafana-deployment.yaml
 │   └── README.md             # deploy order, secrets, common kubectl commands
 ├── .github/workflows/ci.yml # test (matrix) -> lint -> build, gha layer cache
 ├── pyproject.toml           # pytest, coverage, ruff config

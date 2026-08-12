@@ -15,12 +15,15 @@ locally (not pulled from a registry).
 | `postgres-statefulset.yaml` | Postgres StatefulSet + headless Service + PVC |
 | `redis-statefulset.yaml` | Redis StatefulSet (AOF persistence) + headless Service + PVC |
 | `migrate-job.yaml` | one-shot `alembic upgrade head` Job |
-| `api-deployment.yaml` | api Deployment (2 replicas) + ClusterIP Service |
-| `worker-deployment.yaml` | worker Deployment (2 replicas) + headless Service for metrics scraping |
+| `api-deployment.yaml` | api Deployment (2 replicas, `prometheus.io/*` scrape annotations) + ClusterIP Service |
+| `worker-deployment.yaml` | worker Deployment (2 replicas, `prometheus.io/*` scrape annotations) + headless Service for metrics scraping |
 
 No Mailhog manifest — email-channel alerts aren't wired up in this
 cluster (see the `SMTP_HOST` comment in `configmap.yaml`). Nothing else
 depends on it.
+
+`k8s/monitoring/` is a separate namespace (`monitoring`) with its own
+deploy order — see **Monitoring (Prometheus + Grafana)** below.
 
 ## Building and loading images
 
@@ -89,6 +92,59 @@ must match — they're two separate keys because the postgres container
 only wants the bare password, while api/worker/migrate want the full
 connection string.
 
+## Monitoring (Prometheus + Grafana)
+
+Separate namespace (`monitoring`), separate deploy step, deployed after
+the `price-tracker` namespace exists (it scrapes pods in it — nothing
+about deploy order between the two matters for Postgres/Redis/migrate,
+just that api/worker pods need to already be annotated, which they are as
+committed).
+
+| File | Object(s) |
+|---|---|
+| `monitoring/namespace.yaml` | `monitoring` namespace |
+| `monitoring/prometheus-rbac.yaml` | ServiceAccount + ClusterRole + ClusterRoleBinding — Prometheus needs cluster-wide `get/list/watch` on pods/services/endpoints/nodes to run its own service discovery (see the comment in that file for what a missing-RBAC failure actually looks like) |
+| `monitoring/prometheus-config.yaml` | scrape config: `kubernetes_sd_configs` (role: pod) + `relabel_configs` that keep only `prometheus.io/scrape: "true"` pods — heavily commented, since relabeling is the part of a Prometheus config that's hardest to read back later |
+| `monitoring/prometheus-deployment.yaml` | Prometheus Deployment + PVC (7d retention) + ClusterIP Service |
+| `monitoring/grafana-config.yaml` | datasource provisioning (points at the Prometheus Service by DNS name) + dashboard-provider config, both as ConfigMaps — no UI click-ops |
+| `monitoring/grafana-dashboards.yaml` | the two dashboards themselves, as JSON, provisioned from this ConfigMap |
+| `monitoring/grafana-secret.yaml` | placeholder admin credentials — same rule as `k8s/secret.yaml`, never real values in git |
+| `monitoring/grafana-deployment.yaml` | Grafana Deployment + PVC + ClusterIP Service |
+
+Deploy:
+
+```bash
+kubectl apply -f k8s/monitoring/namespace.yaml
+kubectl apply -f k8s/monitoring/prometheus-rbac.yaml
+kubectl apply -f k8s/monitoring/prometheus-config.yaml
+kubectl apply -f k8s/monitoring/prometheus-deployment.yaml
+
+kubectl apply -f k8s/monitoring/grafana-config.yaml
+kubectl apply -f k8s/monitoring/grafana-secret.yaml
+kubectl apply -f k8s/monitoring/grafana-dashboards.yaml
+kubectl apply -f k8s/monitoring/grafana-deployment.yaml
+```
+
+Reach both UIs via port-forward (no Ingress in this cluster — see "Known
+gaps"):
+
+```bash
+kubectl port-forward -n monitoring svc/prometheus 9090:9090
+# → http://localhost:9090/targets  (Status > Targets) to see discovered
+#   api/worker pods and their UP/DOWN state
+
+kubectl port-forward -n monitoring svc/grafana 3000:3000
+# → http://localhost:3000  (user/password from grafana-secret.yaml —
+#   "admin" / "changeme" as committed, unless you replaced the Secret)
+# Dashboards live under the "Price Tracker" folder: "Scraper Health" and
+# "Queue & Workers".
+```
+
+Adding a new scrape target later needs no Prometheus config change at
+all — just the three `prometheus.io/*` annotations on the pod template
+(see `api-deployment.yaml`/`worker-deployment.yaml`); the next scrape
+interval (15s) picks it up automatically via service discovery.
+
 ## Common commands
 
 ```bash
@@ -126,16 +182,28 @@ kubectl rollout restart deployment/api deployment/worker -n price-tracker
 kubectl delete all --all -n price-tracker
 # tear down completely, including the PVCs (destroys the database!)
 kubectl delete namespace price-tracker
+
+# monitoring stack
+kubectl get pods -n monitoring
+kubectl logs -n monitoring deploy/prometheus --tail 50
+kubectl logs -n monitoring deploy/grafana --tail 50
+# scale workers and watch Prometheus pick up the new pod (no config change)
+kubectl scale deployment/worker -n price-tracker --replicas=4
+kubectl delete namespace monitoring   # tear down monitoring only
 ```
 
 ## Known gaps (out of scope for this phase)
 
-- No Ingress — the API is reached via `kubectl port-forward` or
-  `minikube service`, not a real hostname.
-- No Prometheus/Grafana deployed to scrape the metrics endpoints — the
-  worker's headless `worker-metrics` Service is discoverable and ready
-  for a `kubernetes_sd_config` scrape job, but nothing is scraping it yet.
+- No Ingress — both the API and the monitoring UIs are reached via
+  `kubectl port-forward` or `minikube service`, not a real hostname.
 - No HorizontalPodAutoscaler — the api/worker resource `requests` are set
   (an HPA requires them) but no HPA object exists yet.
 - No NetworkPolicy — every pod in the namespace can reach every other pod.
 - Single-replica Postgres/Redis — no failover if that pod's node goes down.
+- Single-replica Prometheus/Grafana too, same caveat, plus: Prometheus's
+  TSDB PVC is `ReadWriteOnce` — fine for one replica, would need a
+  different storage class (or a remote-write setup) before this could
+  ever run more than one Prometheus pod.
+- No alerting rules configured in Prometheus (Alertmanager isn't
+  deployed either) — the two Grafana dashboards are for humans looking,
+  not paging anyone yet.

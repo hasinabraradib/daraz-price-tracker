@@ -1,0 +1,87 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-config
+  namespace: monitoring
+data:
+  prometheus.yml: |
+    global:
+      scrape_interval: 15s
+
+    scrape_configs:
+      - job_name: kubernetes-pods
+
+        # role: pod asks the Kubernetes API for every pod in the cluster
+        # (all namespaces, since no `namespaces:` restriction is set
+        # below) and turns each one into a *candidate* scrape target —
+        # one target per pod, with every bit of pod metadata (namespace,
+        # name, labels, annotations, container ports...) attached as a
+        # __meta_kubernetes_* label. Nothing is actually scraped yet at
+        # this point; that's what relabel_configs decides next.
+        kubernetes_sd_configs:
+          - role: pod
+
+        # relabel_configs run once, at discovery time, before scraping —
+        # they decide *which* of the discovered targets to keep and *what
+        # address/path* to scrape each one at. This is different from
+        # metric_relabel_configs (not used here), which would run *after*
+        # scraping, on the resulting metrics themselves. Every step below
+        # reads a __meta_kubernetes_* label that role: pod attached above
+        # and either keeps/drops the target or rewrites one of the
+        # "magic" __-prefixed labels Prometheus actually uses to scrape
+        # (__address__, __metrics_path__). Labels starting with __ are
+        # dropped after relabeling — they never show up on your metrics —
+        # so anything you want visible in PromQL has to be copied to a
+        # normal label name first, which the last two steps below do.
+        relabel_configs:
+          # Step 1 — the opt-in filter. __meta_kubernetes_pod_annotation_*
+          # is how Prometheus exposes each pod's annotations here. This
+          # keeps a target only if its pod has the annotation
+          # `prometheus.io/scrape: "true"` (see api-deployment.yaml /
+          # worker-deployment.yaml) — action: keep + a target that
+          # *doesn't* match the regex gets dropped entirely. Without this
+          # step, every pod in every namespace would be a scrape target,
+          # including ones with no /metrics endpoint at all.
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+            action: keep
+            regex: "true"
+
+          # Step 2 — port override. __address__ starts out as
+          # "<pod_ip>:<first_declared_container_port>" (or just
+          # "<pod_ip>" with no port if the pod declares none) — usually
+          # not the port you actually want scraped. The regex splits the
+          # existing address into "host" and "(ignored) old port" via the
+          # two capture groups, and the second source label supplies the
+          # replacement port from the pod's `prometheus.io/port`
+          # annotation; replacement stitches host:new-port back together
+          # into __address__, the label Prometheus's HTTP client actually
+          # dials.
+          - source_labels: [__address__, __meta_kubernetes_pod_annotation_prometheus_io_port]
+            action: replace
+            regex: ([^:]+)(?::\d+)?;(\d+)
+            replacement: $1:$2
+            target_label: __address__
+
+          # Step 3 — path override. __metrics_path__ defaults to
+          # "/metrics" already (which is all this app ever uses — see
+          # prometheus.io/path: "/metrics" on both Deployments), but a
+          # future pod with a different path just has to set the
+          # annotation, no Prometheus config change needed. Only replaces
+          # __metrics_path__ when the annotation is actually present
+          # (regex requires ≥1 character) — an unset annotation would
+          # otherwise blank the path out.
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+            action: replace
+            regex: (.+)
+            target_label: __metrics_path__
+
+          # Steps 4-5 — promote metadata from __-prefixed (dropped) labels
+          # to normal ones that survive into the scraped time series, so
+          # Grafana/PromQL can filter or `by (...)` group on them — e.g.
+          # distinguishing which api/worker pod a series came from.
+          - source_labels: [__meta_kubernetes_namespace]
+            action: replace
+            target_label: kubernetes_namespace
+          - source_labels: [__meta_kubernetes_pod_name]
+            action: replace
+            target_label: kubernetes_pod_name

@@ -1,0 +1,295 @@
+# The actual dashboards, as JSON, provisioned from git — not clicked
+# together in the UI. Loaded via grafana-dashboard-provider (in
+# grafana-config.yaml), which points Grafana at
+# /var/lib/grafana/dashboards (where this ConfigMap gets mounted — see
+# grafana-deployment.yaml). Every `datasource.uid` below is pinned to
+# "prometheus", matching the fixed uid set in grafana-datasources
+# (grafana-config.yaml), so these resolve correctly regardless of
+# provisioning order.
+#
+# A note on aggregation that applies across both dashboards: queue_depth,
+# delayed_queue_depth, dead_letter_depth, and products_tracked_total are
+# Gauges that every api and worker pod refreshes from the *same* shared
+# Redis/Postgres state (shared/metrics.py::refresh_gauges) — so Prometheus
+# ends up with one identical-valued series per pod, not a genuine
+# per-pod partial. sum() over them would multiply the true value by
+# however many pods happen to be scraped, which is wrong; max() (or
+# avg()) collapses the duplicates back to the real number. Counters
+# (scrape_attempts_total, jobs_enqueued_total, ...) are the opposite —
+# each pod's counter really is only that pod's share of the total, so
+# those correctly use sum(rate(...)).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-dashboards
+  namespace: monitoring
+data:
+  scraper-health.json: |
+    {
+      "uid": "scraper-health",
+      "title": "Scraper Health",
+      "tags": ["price-tracker"],
+      "timezone": "browser",
+      "schemaVersion": 39,
+      "version": 1,
+      "editable": true,
+      "refresh": "10s",
+      "time": { "from": "now-1h", "to": "now" },
+      "templating": { "list": [] },
+      "panels": [
+        {
+          "id": 1,
+          "type": "timeseries",
+          "title": "Scrape rate: success vs failure",
+          "description": "sum(rate(...)) across all worker pods — counters are additive per pod, so summing is correct here (unlike the gauge panels below).",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "gridPos": { "x": 0, "y": 0, "w": 12, "h": 8 },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "reqps",
+              "custom": { "stacking": { "mode": "normal" }, "fillOpacity": 30 }
+            },
+            "overrides": []
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": { "type": "prometheus", "uid": "prometheus" },
+              "expr": "sum(rate(scrape_attempts_total{outcome=\"success\"}[5m]))",
+              "legendFormat": "success"
+            },
+            {
+              "refId": "B",
+              "datasource": { "type": "prometheus", "uid": "prometheus" },
+              "expr": "sum(rate(scrape_attempts_total{outcome=\"failure\"}[5m]))",
+              "legendFormat": "failure"
+            }
+          ]
+        },
+        {
+          "id": 2,
+          "type": "stat",
+          "title": "Scrape success rate",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "gridPos": { "x": 12, "y": 0, "w": 6, "h": 8 },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "percent",
+              "min": 0,
+              "max": 100,
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  { "color": "red", "value": null },
+                  { "color": "yellow", "value": 90 },
+                  { "color": "green", "value": 99 }
+                ]
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "reduceOptions": { "calcs": ["lastNotNull"] },
+            "graphMode": "area"
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": { "type": "prometheus", "uid": "prometheus" },
+              "expr": "100 * sum(rate(scrape_attempts_total{outcome=\"success\"}[5m])) / sum(rate(scrape_attempts_total[5m]))",
+              "legendFormat": "success rate"
+            }
+          ]
+        },
+        {
+          "id": 3,
+          "type": "timeseries",
+          "title": "Scrape duration: p50 / p95 / p99",
+          "description": "histogram_quantile over scrape_duration_seconds_bucket, aggregated across all worker pods first (sum by (le)) so the quantile reflects the whole fleet, not one pod's bucket set.",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "gridPos": { "x": 18, "y": 0, "w": 6, "h": 8 },
+          "fieldConfig": {
+            "defaults": { "unit": "s" },
+            "overrides": []
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": { "type": "prometheus", "uid": "prometheus" },
+              "expr": "histogram_quantile(0.50, sum(rate(scrape_duration_seconds_bucket[5m])) by (le))",
+              "legendFormat": "p50"
+            },
+            {
+              "refId": "B",
+              "datasource": { "type": "prometheus", "uid": "prometheus" },
+              "expr": "histogram_quantile(0.95, sum(rate(scrape_duration_seconds_bucket[5m])) by (le))",
+              "legendFormat": "p95"
+            },
+            {
+              "refId": "C",
+              "datasource": { "type": "prometheus", "uid": "prometheus" },
+              "expr": "histogram_quantile(0.99, sum(rate(scrape_duration_seconds_bucket[5m])) by (le))",
+              "legendFormat": "p99"
+            }
+          ]
+        },
+        {
+          "id": 4,
+          "type": "timeseries",
+          "title": "Failures by error_type",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "gridPos": { "x": 0, "y": 8, "w": 12, "h": 8 },
+          "fieldConfig": {
+            "defaults": { "unit": "reqps", "custom": { "fillOpacity": 20 } },
+            "overrides": []
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": { "type": "prometheus", "uid": "prometheus" },
+              "expr": "sum(rate(scrape_attempts_total{outcome=\"failure\"}[5m])) by (error_type)",
+              "legendFormat": "{{error_type}}"
+            }
+          ]
+        },
+        {
+          "id": 5,
+          "type": "timeseries",
+          "title": "Dead letter queue depth",
+          "description": "max(dead_letter_depth), not sum() — this Gauge is the same cluster-wide count reported redundantly by every api/worker pod, so max (or avg) gives the real number; sum would multiply it by the pod count.",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "gridPos": { "x": 12, "y": 8, "w": 12, "h": 8 },
+          "fieldConfig": {
+            "defaults": { "unit": "short" },
+            "overrides": []
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": { "type": "prometheus", "uid": "prometheus" },
+              "expr": "max(dead_letter_depth)",
+              "legendFormat": "dead letter depth"
+            }
+          ]
+        }
+      ]
+    }
+  queue-and-workers.json: |
+    {
+      "uid": "queue-and-workers",
+      "title": "Queue & Workers",
+      "tags": ["price-tracker"],
+      "timezone": "browser",
+      "schemaVersion": 39,
+      "version": 1,
+      "editable": true,
+      "refresh": "10s",
+      "time": { "from": "now-1h", "to": "now" },
+      "templating": { "list": [] },
+      "panels": [
+        {
+          "id": 1,
+          "type": "timeseries",
+          "title": "Main queue depth",
+          "description": "The panel that matters for the HPA: sustained growth here means workers can't drain jobs as fast as they arrive. max(queue_depth), not sum() — every pod reports the same cluster-wide Redis list length (see the ConfigMap-level note in this file's header comment).",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "gridPos": { "x": 0, "y": 0, "w": 12, "h": 8 },
+          "fieldConfig": {
+            "defaults": { "unit": "short" },
+            "overrides": []
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": { "type": "prometheus", "uid": "prometheus" },
+              "expr": "max(queue_depth)",
+              "legendFormat": "queue depth"
+            }
+          ]
+        },
+        {
+          "id": 2,
+          "type": "timeseries",
+          "title": "Delayed retry queue depth",
+          "description": "max(delayed_queue_depth) — jobs currently waiting out a retry backoff (shared/retry.py). Same redundant-gauge reasoning as the main queue depth panel.",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "gridPos": { "x": 12, "y": 0, "w": 12, "h": 8 },
+          "fieldConfig": {
+            "defaults": { "unit": "short" },
+            "overrides": []
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": { "type": "prometheus", "uid": "prometheus" },
+              "expr": "max(delayed_queue_depth)",
+              "legendFormat": "delayed queue depth"
+            }
+          ]
+        },
+        {
+          "id": 3,
+          "type": "timeseries",
+          "title": "Jobs enqueued rate vs jobs processed rate",
+          "description": "A persistent gap between these two lines — enqueued consistently outpacing processed, not just a brief spike — is the signal you're under-provisioned: the queue is growing faster than workers can drain it. That's the trigger to scale worker replicas (or investigate what slowed processing down), not the raw queue depth number alone.",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "gridPos": { "x": 0, "y": 8, "w": 12, "h": 8 },
+          "fieldConfig": {
+            "defaults": { "unit": "reqps", "custom": { "fillOpacity": 10 } },
+            "overrides": []
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": { "type": "prometheus", "uid": "prometheus" },
+              "expr": "sum(rate(jobs_enqueued_total[5m]))",
+              "legendFormat": "enqueued"
+            },
+            {
+              "refId": "B",
+              "datasource": { "type": "prometheus", "uid": "prometheus" },
+              "expr": "sum(rate(scrape_attempts_total[5m]))",
+              "legendFormat": "processed (success + failure)"
+            }
+          ]
+        },
+        {
+          "id": 4,
+          "type": "timeseries",
+          "title": "Alerts fired by rule_type",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "gridPos": { "x": 12, "y": 8, "w": 12, "h": 8 },
+          "fieldConfig": {
+            "defaults": { "unit": "reqps", "custom": { "fillOpacity": 20 } },
+            "overrides": []
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": { "type": "prometheus", "uid": "prometheus" },
+              "expr": "sum(rate(alerts_fired_total[5m])) by (rule_type)",
+              "legendFormat": "{{rule_type}}"
+            }
+          ]
+        },
+        {
+          "id": 5,
+          "type": "timeseries",
+          "title": "Alert delivery success/failure by channel",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "gridPos": { "x": 0, "y": 16, "w": 24, "h": 8 },
+          "fieldConfig": {
+            "defaults": { "unit": "reqps", "custom": { "fillOpacity": 20 } },
+            "overrides": []
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": { "type": "prometheus", "uid": "prometheus" },
+              "expr": "sum(rate(alert_deliveries_total[5m])) by (channel, status)",
+              "legendFormat": "{{channel}} - {{status}}"
+            }
+          ]
+        }
+      ]
+    }

@@ -1,0 +1,40 @@
+# Prometheus's kubernetes_sd_configs (prometheus-config.yaml) works by
+# calling the Kubernetes API itself — "list all pods in the cluster, then
+# watch for changes" — not by anything Kubernetes pushes to it. Without
+# permission to actually call that API, the pod starts fine, the /-/ready
+# and /-/healthy probes pass, the UI loads... and the Targets page is
+# just empty. No error, no crash, no log line pointing at "RBAC" unless
+# you go looking — service discovery silently discovers nothing. This is
+# the single most common reason "I deployed Prometheus and it doesn't see
+# my pods" happens in the wild.
+#
+# A ClusterRole (not a namespaced Role) because pods to scrape live in
+# price-tracker, not monitoring — the ServiceAccount needs to list/watch
+# across namespace boundaries, which only a ClusterRole(Binding) grants.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: prometheus
+  namespace: monitoring
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: prometheus
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "services", "endpoints", "nodes"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: prometheus
+subjects:
+  - kind: ServiceAccount
+    name: prometheus
+    namespace: monitoring
+roleRef:
+  kind: ClusterRole
+  name: prometheus
+  apiGroup: rbac.authorization.k8s.io
