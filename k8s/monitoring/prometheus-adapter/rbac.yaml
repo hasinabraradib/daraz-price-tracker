@@ -1,0 +1,130 @@
+# prometheus-adapter is not a regular pod that k8s components merely
+# "look at" — it registers itself as an extension (aggregated) API server
+# implementing custom.metrics.k8s.io, and the main Kubernetes API server
+# proxies every request under that group straight to it. That changes what
+# RBAC it needs in two distinct directions:
+#
+#  1. *Incoming*: the main apiserver forwards the caller's identity to the
+#     adapter via request headers (not a re-usable token), and the adapter
+#     must be able to validate that those headers really came from the
+#     trusted apiserver and not something forged. That validation needs
+#     two specific, standard grants — system:auth-delegator (below) and
+#     the extension-apiserver-authentication-reader RoleBinding — that
+#     have nothing to do with what the adapter *does* and everything to do
+#     with it being pluggable API-server infrastructure. Skip either one
+#     and the APIService still registers, but every request to it fails
+#     authentication — a much more confusing failure than a normal pod
+#     hitting a 403 on its own API calls.
+#  2. *Outgoing*: the adapter itself needs to read a handful of core k8s
+#     resources (namespaces/pods/services) to resolve which Prometheus
+#     labels map to which k8s objects — that's the ordinary
+#     custom-metrics-resource-reader ClusterRole below.
+#
+# There's a third, easy-to-miss direction too: the HPA controller (running
+# inside kube-controller-manager) is itself just another API client from
+# the aggregated apiserver's point of view, and needs its own explicit
+# grant to call custom.metrics.k8s.io — see hpa-controller-custom-metrics
+# at the bottom. Without it, the APIService comes up Available=True, `kubectl
+# get --raw` works (you're cluster-admin), and the HPA still shows
+# <unknown> for the metric, because the HPA controller's own service
+# account was never authorized to ask.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: custom-metrics-apiserver
+  namespace: monitoring
+---
+# Lets the adapter delegate access-control decisions for incoming requests
+# back to the main apiserver (via SubjectAccessReview) instead of having
+# to know Kubernetes' full RBAC model itself — the standard grant every
+# aggregated API server needs, this exact ClusterRole, no more.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: custom-metrics-apiserver:system:auth-delegator
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:auth-delegator
+subjects:
+  - kind: ServiceAccount
+    name: custom-metrics-apiserver
+    namespace: monitoring
+---
+# Lets the adapter read the extension-apiserver-authentication ConfigMap
+# in kube-system, which holds the CA bundle the main apiserver signs its
+# proxied-request headers with — how the adapter tells "a real request
+# forwarded by the trusted apiserver" apart from "anyone with network
+# access to my Service pretending to be it." This Role already exists
+# cluster-wide (built in); only the RoleBinding is ours to create.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: custom-metrics-auth-reader
+  namespace: kube-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: extension-apiserver-authentication-reader
+subjects:
+  - kind: ServiceAccount
+    name: custom-metrics-apiserver
+    namespace: monitoring
+---
+# What the adapter's own process needs to read from the regular
+# Kubernetes API to resolve Prometheus labels (kubernetes_namespace,
+# kubernetes_pod_name, ...) into actual namespace/pod/service objects.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: custom-metrics-resource-reader
+rules:
+  - apiGroups: [""]
+    resources: ["namespaces", "pods", "services"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: custom-metrics-apiserver:resource-reader
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: custom-metrics-resource-reader
+subjects:
+  - kind: ServiceAccount
+    name: custom-metrics-apiserver
+    namespace: monitoring
+---
+# The grant every *client* of custom.metrics.k8s.io needs — most
+# importantly the HPA controller itself. minikube's kube-controller-manager
+# runs with --use-service-account-credentials=true, which means the HPA
+# control loop authenticates as this specific ServiceAccount
+# (system:serviceaccount:kube-system:horizontal-pod-autoscaler), not as
+# some generic cluster-admin identity — confirmed by checking the running
+# kube-controller-manager pod's own flags before writing this. Miss this
+# binding and `kubectl describe hpa` sits on
+# `<unknown>` forever with no error surfaced anywhere obvious, because the
+# 403 happens one hop away, inside kube-controller-manager's own logs, not
+# in anything the HPA object itself reports.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: custom-metrics-server-resources
+rules:
+  - apiGroups: ["custom.metrics.k8s.io"]
+    resources: ["*"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: hpa-controller-custom-metrics
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: custom-metrics-server-resources
+subjects:
+  - kind: ServiceAccount
+    name: horizontal-pod-autoscaler
+    namespace: kube-system

@@ -30,6 +30,9 @@ for shoppers watching a price.
   the worker — see **Metrics** below), scraped by a Prometheus server and
   visualized in Grafana when deployed to Kubernetes (see **Monitoring**
   under **Kubernetes** below) — docker-compose alone doesn't run either
+- prometheus-adapter + HorizontalPodAutoscaler — `worker` autoscales on
+  `queue_depth` when deployed to Kubernetes (see **Autoscaling** under
+  **Kubernetes** below) — no autoscaling in docker-compose, obviously
 - Docker Compose for local dev, Kubernetes manifests for a local minikube
   deploy (see **Kubernetes** below)
 
@@ -485,6 +488,69 @@ not clicked together in the UI:
   the two is the under-provisioned signal), alerts fired by rule type,
   alert delivery success/failure by channel.
 
+### Autoscaling (prometheus-adapter + HPA)
+
+The `worker` Deployment autoscales on **queue depth**, not CPU/memory —
+a worker idling between Playwright launches looks the same on CPU
+whether the queue has 2 jobs or 2000, so resource-based autoscaling
+wouldn't track the thing that actually matters. Getting a custom,
+application-defined metric like `queue_depth` in front of the
+Kubernetes HPA needs a chain of five separate hops, each documented at
+its own source file (full detail in
+[`k8s/README.md`](k8s/README.md#autoscaling-prometheus-adapter--hpa)):
+
+```
+app /metrics  →  Prometheus scrapes it  →  prometheus-adapter runs a
+PromQL query against Prometheus  →  custom.metrics.k8s.io (an aggregated
+API the adapter itself serves)  →  HPA controller polls that API and
+resizes the worker Deployment
+```
+
+```bash
+kubectl apply -f k8s/monitoring/prometheus-adapter/rbac.yaml
+kubectl apply -f k8s/monitoring/prometheus-adapter/config.yaml
+kubectl apply -f k8s/monitoring/prometheus-adapter/deployment.yaml
+kubectl apply -f k8s/monitoring/prometheus-adapter/apiservice.yaml
+kubectl apply -f k8s/worker-hpa.yaml
+
+kubectl get apiservice v1beta1.custom.metrics.k8s.io   # Available: True
+kubectl describe hpa worker -n price-tracker           # a real number, not <unknown>
+```
+
+Two design points worth knowing before touching either file:
+
+- **`queue_depth` is an Object metric on the `price-tracker` Namespace,
+  not a Pods metric.** Every api and worker pod reports the *identical*
+  Redis-derived number (see **Metrics** above), so the adapter's rule
+  collapses duplicates with `max()`, never `sum()` — summing would
+  multiply the true value by however many pods happen to be scraped.
+  Pods-type would compound this further: its HPA formula multiplies by
+  `currentReplicas`, so a duplicated value would inflate on every
+  scale-up and feed back into the next cycle. The Object-metric,
+  `AverageValue`-target formula is a direct division —
+  `desiredReplicas = ceil(queue_depth / 10)` — with no such feedback
+  term. Full reasoning in `k8s/monitoring/prometheus-adapter/config.yaml`
+  and `k8s/worker-hpa.yaml`.
+- **Scale-up and scale-down are deliberately asymmetric.** Scale-up has
+  no stabilization window and allows doubling per minute — a growing
+  queue means real work is waiting. Scale-down waits 5 minutes and
+  removes at most 1 pod/minute — a half-finished Playwright scrape that
+  gets killed by a hasty scale-down is wasted work, not just a delay (the
+  job was already popped off the queue, so it isn't retried for free).
+
+The RBAC in `prometheus-adapter/rbac.yaml` is the part most likely to
+look fine and not be: the APIService can register as `Available: True`
+and `kubectl get --raw` can work perfectly (you're cluster-admin) while
+the HPA controller *itself* is still unauthorized to call
+`custom.metrics.k8s.io` — it runs as its own ServiceAccount
+(`system:serviceaccount:kube-system:horizontal-pod-autoscaler` on a
+kubeadm-style cluster, which minikube is), and needs its own explicit
+grant. That failure mode shows up as `kubectl describe hpa` sitting on
+`<unknown>` forever, with no error surfaced on the HPA object itself —
+see the k8s README's verification steps for how to check every hop
+individually instead of trusting that "pods are Running" means the whole
+chain works.
+
 ## Migrations
 
 Migrations live in `api/alembic/`. To generate a new migration after
@@ -623,6 +689,7 @@ daraz-price-tracker/
 │   ├── migrate-job.yaml
 │   ├── api-deployment.yaml   # prometheus.io/* scrape annotations included
 │   ├── worker-deployment.yaml # prometheus.io/* scrape annotations included
+│   ├── worker-hpa.yaml        # HPA on queue_depth
 │   ├── monitoring/            # separate "monitoring" namespace
 │   │   ├── namespace.yaml
 │   │   ├── prometheus-rbac.yaml
@@ -631,7 +698,12 @@ daraz-price-tracker/
 │   │   ├── grafana-config.yaml        # datasource + dashboard-provider provisioning
 │   │   ├── grafana-dashboards.yaml    # the 2 dashboards, as JSON
 │   │   ├── grafana-secret.yaml        # placeholders only
-│   │   └── grafana-deployment.yaml
+│   │   ├── grafana-deployment.yaml
+│   │   └── prometheus-adapter/        # custom.metrics.k8s.io, backs the HPA
+│   │       ├── rbac.yaml              # incl. the HPA controller's own grant
+│   │       ├── config.yaml            # adapter rules: max() not sum(), see comments
+│   │       ├── apiservice.yaml
+│   │       └── deployment.yaml
 │   └── README.md             # deploy order, secrets, common kubectl commands
 ├── .github/workflows/ci.yml # test (matrix) -> lint -> build, gha layer cache
 ├── pyproject.toml           # pytest, coverage, ruff config

@@ -1,0 +1,31 @@
+# Registers the adapter with the main Kubernetes API server as the
+# implementation of the custom.metrics.k8s.io/v1beta1 API group — from
+# this point on, any request to /apis/custom.metrics.k8s.io/v1beta1/...
+# (from kubectl, the HPA controller, anything) gets proxied by the main
+# apiserver straight to the `prometheus-adapter` Service below, over
+# HTTPS. `kubectl get apiservice v1beta1.custom.metrics.k8s.io` showing
+# Available=True means this registration succeeded and the main apiserver
+# was able to reach the adapter's health check — it does NOT mean the
+# adapter's rules (config.yaml) are correct or that any RBAC further down
+# the chain is wired up; those fail separately and later.
+apiVersion: apiregistration.k8s.io/v1
+kind: APIService
+metadata:
+  name: v1beta1.custom.metrics.k8s.io
+spec:
+  group: custom.metrics.k8s.io
+  version: v1beta1
+  service:
+    name: prometheus-adapter
+    namespace: monitoring
+    port: 443
+  groupPriorityMinimum: 100
+  versionPriority: 100
+  # The adapter generates its own self-signed serving certificate on
+  # startup (--cert-dir=/tmp in deployment.yaml) rather than being issued
+  # one from the cluster's CA, so the main apiserver has no CA bundle to
+  # verify it against. insecureSkipTLSVerify is the pragmatic choice for
+  # a local minikube deploy; a real cluster would instead set `caBundle`
+  # here to the adapter's actual serving CA (e.g. via cert-manager) and
+  # drop this.
+  insecureSkipTLSVerify: true

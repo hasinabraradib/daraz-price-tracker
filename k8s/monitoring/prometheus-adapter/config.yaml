@@ -1,0 +1,117 @@
+# prometheus-adapter's rule config — the translation layer between "a
+# PromQL query" and "a value the custom metrics API can hand the HPA
+# controller." Every rule below has the same four fields; what each one
+# does (this is the part worth understanding once, since the syntax
+# itself gives few hints):
+#
+#   seriesQuery   — a PromQL *selector* (not a full query) identifying
+#                   which raw Prometheus series this rule applies to.
+#                   Just picks the haystack; doesn't aggregate anything.
+#   resources     — how to map that series' Prometheus labels onto real
+#                   Kubernetes objects, so the metric becomes queryable as
+#                   "this pod's/namespace's/service's <metric>" through
+#                   the custom metrics API's REST shape. `overrides` is a
+#                   dict of {prometheus_label: {resource: k8s-resource-type}}.
+#   name          — how the raw series name becomes the metric name
+#                   exposed via the API. `matches` is a regex against the
+#                   series' __name__; `as` is the exposed name (can use
+#                   the regex's capture groups, unused here since it's a
+#                   flat rename).
+#   metricsQuery  — the actual PromQL template run to compute the value,
+#                   with placeholders the adapter fills in per-request:
+#                   <<.Series>> (the metric name from seriesQuery),
+#                   <<.LabelMatchers>> (namespace/pod/etc. constraints
+#                   from the specific API request being served), and
+#                   <<.GroupBy>> (the label(s) named in `resources.overrides`
+#                   — here just kubernetes_namespace). `by (<<.GroupBy>>)`
+#                   in every rule below is NOT optional decoration: max()
+#                   or sum() with no `by (...)` collapses the result to a
+#                   single value with *no labels at all*, and the adapter
+#                   then can't tell which k8s object that value belongs to
+#                   — every query fails with "None of the results ...
+#                   matched the resource name" even though Prometheus
+#                   itself answered fine. Learned this the hard way while
+#                   verifying this exact rule: keep the label that
+#                   `resources.overrides` maps to, or the mapping is
+#                   pointless.
+#
+# queue_depth and dead_letter_depth are Gauges read from Redis by
+# shared/metrics.py::refresh_gauges() — every api AND worker pod reports
+# the *same* cluster-wide number every time it's scraped (see
+# shared/metrics.py and k8s/monitoring/grafana-dashboards.yaml, which hits
+# this identical issue on the Grafana side). A metricsQuery of
+# `sum(<<.Series>>{<<.LabelMatchers>>})` would add up N identical copies
+# of the true value — 6 pods reporting queue_depth=50 would come back as
+# 300, and since the HPA's own desiredReplicas math scales with the
+# metric value, that inflated number directly over-provisions workers,
+# and *worse*, each successful scale-up adds more pods (worker pods report
+# this same metric too), which inflates the sum further next cycle — a
+# self-reinforcing feedback loop with no natural ceiling short of
+# maxReplicas. `max(...)` collapses the duplicates back to the one real
+# number regardless of how many pods happen to be scraped.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-adapter-config
+  namespace: monitoring
+data:
+  config.yaml: |
+    rules:
+      # Exposed as a Namespace-associated ("Object") metric — queue_depth
+      # isn't really any single pod's own number, it's Redis's, so
+      # associating it with the price-tracker Namespace itself (rather
+      # than forcing an artificial per-pod split) is the honest mapping.
+      # This is what worker-hpa.yaml's `describedObject: {kind: Namespace}`
+      # targets.
+      - seriesQuery: '{__name__="queue_depth",kubernetes_namespace!=""}'
+        resources:
+          overrides:
+            kubernetes_namespace: { resource: "namespace" }
+        name:
+          matches: "^queue_depth$"
+          as: "queue_depth"
+        # by (<<.GroupBy>>) here is just kubernetes_namespace — every
+        # matched series already has an identical *value* (that's the
+        # whole point of max() over sum(), see the header comment), we
+        # only need the grouping to keep the namespace label on the
+        # result so the adapter can resolve it back to a resource.
+        metricsQuery: 'max(<<.Series>>{<<.LabelMatchers>>}) by (<<.GroupBy>>)'
+
+      # Same shape, same reasoning, different Redis structure (the delayed
+      # dead-letter hash instead of the main list) — dead_letter_depth is
+      # exposed mainly so it's genuinely queryable through the custom
+      # metrics API (e.g. for a future HPA/alert), not because worker-hpa.yaml
+      # uses it as a scaling signal today.
+      - seriesQuery: '{__name__="dead_letter_depth",kubernetes_namespace!=""}'
+        resources:
+          overrides:
+            kubernetes_namespace: { resource: "namespace" }
+        name:
+          matches: "^dead_letter_depth$"
+          as: "dead_letter_depth"
+        metricsQuery: 'max(<<.Series>>{<<.LabelMatchers>>}) by (<<.GroupBy>>)'
+
+      # scrape_duration_seconds is the opposite case from the two gauges
+      # above: it's a Histogram, and each pod's _bucket counters really
+      # are that pod's own share of the total observations — nothing
+      # duplicated, so summing rates across pods before taking the
+      # quantile is the textbook-correct way to compute a cluster-wide
+      # percentile (same reasoning as the p50/p95/p99 panel in
+      # k8s/monitoring/grafana-dashboards.yaml). seriesQuery matches the
+      # raw _bucket series (that's where the `le` label lives, which
+      # histogram_quantile needs), not the metric name from
+      # shared/metrics.py directly.
+      - seriesQuery: '{__name__="scrape_duration_seconds_bucket",kubernetes_namespace!=""}'
+        resources:
+          overrides:
+            kubernetes_namespace: { resource: "namespace" }
+        name:
+          matches: "^scrape_duration_seconds_bucket$"
+          as: "scrape_duration_seconds_p95"
+        # `by (le, <<.GroupBy>>)`: `le` is non-negotiable — that's the
+        # bucket-boundary label histogram_quantile itself needs — and
+        # kubernetes_namespace has to ride along in the same `by (...)`
+        # for the same resource-association reason as the two rules
+        # above, or histogram_quantile's output loses the namespace label
+        # right along with `le`.
+        metricsQuery: 'histogram_quantile(0.95, sum(rate(<<.Series>>{<<.LabelMatchers>>}[5m])) by (le, <<.GroupBy>>))'

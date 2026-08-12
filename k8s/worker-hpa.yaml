@@ -1,0 +1,91 @@
+# Scales the worker Deployment on queue_depth — a metric the worker
+# itself has no HTTP-request-based signal for (it pulls jobs, nothing
+# pushes to it), which is exactly why CPU/memory-based autoscaling
+# wouldn't reflect "are we falling behind" here: a worker sitting idle
+# between Playwright launches looks the same on CPU whether the queue has
+# 2 jobs or 2000.
+#
+# type: Object, not Pods — queue_depth is Redis's number, not any one
+# pod's own contribution (see the long comment in
+# k8s/monitoring/prometheus-adapter/config.yaml). describedObject targets
+# the price-tracker Namespace itself rather than a specific
+# Service/Deployment, because that's the honest scope of what this metric
+# actually describes.
+#
+# target.type: AverageValue, averageValue: "10" — "roughly 10 queued jobs
+# per worker pod." For an Object metric with an AverageValue target, the
+# HPA controller's formula is a direct division, no feedback through
+# currentReplicas:
+#
+#     desiredReplicas = ceil( currentMetricValue / targetAverageValue )
+#
+# e.g. queue_depth=45 -> ceil(45/10) = 5 workers. This is deliberately
+# *not* type: Pods: a Pods metric's formula instead multiplies by
+# currentReplicas (desiredReplicas = ceil(currentReplicas *
+# avgPerPodValue / target)), and because every worker pod reports the
+# *same* queue_depth value (it's Redis's number, duplicated across pods,
+# not a genuine per-pod average), that formula would double-count on every
+# scale-up: more replicas would inflate the computed "average" input into
+# the next cycle even though the real queue hadn't grown at all — a
+# feedback loop with no natural ceiling short of maxReplicas. AverageValue
+# on an Object metric sidesteps that entirely: currentReplicas isn't a
+# term in the formula at all.
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: worker
+  namespace: price-tracker
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: worker
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Object
+      object:
+        describedObject:
+          apiVersion: v1
+          kind: Namespace
+          name: price-tracker
+        metric:
+          name: queue_depth
+        target:
+          type: AverageValue
+          averageValue: "10"
+  behavior:
+    # Scale up fast: a growing queue means real jobs are waiting and
+    # every extra minute at the wrong replica count is Daraz pages not
+    # getting scraped. stabilizationWindowSeconds: 0 reacts to the very
+    # latest metric reading instead of waiting to see if it holds steady;
+    # allowing 100%-per-minute (doubling) growth means a sudden burst
+    # doesn't take many sync cycles to catch up on.
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      policies:
+        - type: Percent
+          value: 100
+          periodSeconds: 60
+      selectPolicy: Max
+    # Scale down slowly, on purpose — asymmetric with scale-up.
+    # terminationGracePeriodSeconds: 90 on the worker Deployment exists
+    # specifically so an in-flight Playwright scrape can finish instead of
+    # being killed mid-request, but that only helps if a scale-down
+    # *decision* doesn't get made carelessly in the first place: a
+    # half-finished scrape that does get killed is wasted work (a job
+    # that was already popped off the queue, so it isn't just retried for
+    # free — see shared/queue.py). stabilizationWindowSeconds: 300 makes
+    # the HPA look back 5 minutes and use the *highest* recommendation
+    # seen in that window before scaling down, so a queue that's merely
+    # dipped briefly doesn't trigger a pod removal that then has to be
+    # immediately undone. Removing at most 1 pod per minute on top of that
+    # means even a real, sustained drop in queue depth drains out
+    # gradually rather than in one big cut.
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 60
+      selectPolicy: Min
