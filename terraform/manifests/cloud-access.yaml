@@ -1,0 +1,67 @@
+# Cloud-demo-specific access, layered on top of the portable k8s/
+# manifests rather than editing them — k8s/*.yaml is written to apply
+# unchanged to any conformant cluster (minikube, this k3s box, anything
+# else), and how a specific deployment target gets *exposed* to the
+# outside world is a property of that target, not of the app itself. Only
+# applied by terraform/deploy.sh, never part of the minikube walkthrough
+# in k8s/README.md.
+#
+# api goes through k3s's bundled Traefik ingress controller on port 80
+# (matches the security group's HTTP rule in network.tf) rather than a
+# NodePort — it's the actual product being demoed, so a plain
+# http://<ip>/ is worth the small extra step an Ingress needs over a bare
+# Service. `ingressClassName: traefik` is k3s's default ingress
+# controller, already running with no extra install (see user_data.sh.tpl
+# — it ships inside k3s itself, nothing separate to deploy here).
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: api-demo-access
+  namespace: price-tracker
+spec:
+  ingressClassName: traefik
+  rules:
+    - http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: api
+                port:
+                  number: 8000
+---
+# Grafana and Prometheus are admin/observability tools, not the product —
+# a plain http://<ip>:<port> via NodePort is enough for them and avoids
+# adding path-based routing rules to the ingress for things that aren't
+# the demo's main attraction. Fixed nodePorts (rather than an
+# auto-assigned one from the 30000-32767 range) so the URLs in
+# `terraform output demo_urls` and deploy.sh's printed summary are
+# actually correct without having to look anything up after the fact.
+apiVersion: v1
+kind: Service
+metadata:
+  name: grafana-demo-access
+  namespace: monitoring
+spec:
+  type: NodePort
+  selector:
+    app: grafana
+  ports:
+    - port: 3000
+      targetPort: 3000
+      nodePort: 30030
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: prometheus-demo-access
+  namespace: monitoring
+spec:
+  type: NodePort
+  selector:
+    app: prometheus
+  ports:
+    - port: 9090
+      targetPort: 9090
+      nodePort: 30090

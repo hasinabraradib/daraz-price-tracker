@@ -1,0 +1,26 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Deliberately no dark-mode media query — this is a small, fixed-palette
+   demo surface, not a product with a theming system. One calm look. */
+
+@layer base {
+  h1,
+  h2,
+  h3 {
+    font-family: var(--font-display);
+    font-weight: 600;
+    letter-spacing: -0.01em;
+  }
+}
+
+@layer utilities {
+  /* For prices and other figures — tabular alignment (so digits line up
+     in a column, e.g. price lists) plus the monospace's slightly
+     ledger-like precision, distinct from surrounding prose. */
+  .font-figure {
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+  }
+}

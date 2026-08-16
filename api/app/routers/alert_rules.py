@@ -2,18 +2,12 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.deps import get_owned_product_or_404, get_owner_email
 from app.schemas import AlertRuleCreate, AlertRuleRead
 from shared.database import get_db
 from shared.models import AlertRule, Product
 
 router = APIRouter(prefix="/products", tags=["alert-rules"])
-
-
-async def _get_product_or_404(db: AsyncSession, product_id: int) -> Product:
-    product = await db.get(Product, product_id)
-    if product is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="product not found")
-    return product
 
 
 @router.post(
@@ -22,10 +16,12 @@ async def _get_product_or_404(db: AsyncSession, product_id: int) -> Product:
     status_code=status.HTTP_201_CREATED,
 )
 async def create_alert_rule(
-    product_id: int, payload: AlertRuleCreate, db: AsyncSession = Depends(get_db)
+    product_id: int,
+    payload: AlertRuleCreate,
+    db: AsyncSession = Depends(get_db),
+    _owned: Product = Depends(get_owned_product_or_404),
+    owner_email: str | None = Depends(get_owner_email),
 ):
-    await _get_product_or_404(db, product_id)
-
     rule = AlertRule(
         product_id=product_id,
         rule_type=payload.rule_type,
@@ -33,6 +29,7 @@ async def create_alert_rule(
         threshold_pct=payload.threshold_pct,
         channel=payload.channel,
         destination=payload.destination,
+        owner_email=owner_email,
     )
     db.add(rule)
     await db.commit()
@@ -41,9 +38,11 @@ async def create_alert_rule(
 
 
 @router.get("/{product_id}/alert-rules", response_model=list[AlertRuleRead])
-async def list_alert_rules(product_id: int, db: AsyncSession = Depends(get_db)):
-    await _get_product_or_404(db, product_id)
-
+async def list_alert_rules(
+    product_id: int,
+    db: AsyncSession = Depends(get_db),
+    _owned: Product = Depends(get_owned_product_or_404),
+):
     stmt = (
         select(AlertRule)
         .where(AlertRule.product_id == product_id)
@@ -55,7 +54,12 @@ async def list_alert_rules(product_id: int, db: AsyncSession = Depends(get_db)):
 @router.delete(
     "/{product_id}/alert-rules/{rule_id}", status_code=status.HTTP_204_NO_CONTENT
 )
-async def delete_alert_rule(product_id: int, rule_id: int, db: AsyncSession = Depends(get_db)):
+async def delete_alert_rule(
+    product_id: int,
+    rule_id: int,
+    db: AsyncSession = Depends(get_db),
+    _owned: Product = Depends(get_owned_product_or_404),
+):
     stmt = select(AlertRule).where(AlertRule.id == rule_id, AlertRule.product_id == product_id)
     rule = (await db.execute(stmt)).scalars().first()
     if rule is None:

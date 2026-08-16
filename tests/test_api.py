@@ -537,3 +537,250 @@ async def test_list_alerts_filters_by_product_and_status(client, db_session):
     resolved_response = await client.get("/alerts?status=resolved")
     assert len(resolved_response.json()) == 1
     assert resolved_response.json()[0]["message"] == "resolved for mine"
+
+
+# ---- owner_email ("Option B" ownership — see api/app/deps.py) ----
+# THIS IS NOT AUTHENTICATION: X-Owner-Email is just a client-supplied
+# string, never verified. These tests confirm the filtering behavior
+# that string drives, not any kind of access control guarantee.
+
+
+@pytest.mark.asyncio
+async def test_create_product_sets_owner_email_from_header(client):
+    response = await client.post(
+        "/products",
+        json={"name": "Owned", "daraz_url": "https://www.daraz.pk/products/owned-i1-s1.html"},
+        headers={"X-Owner-Email": "alice@example.com"},
+    )
+    assert response.status_code == 201
+    assert response.json()["owner_email"] == "alice@example.com"
+
+
+@pytest.mark.asyncio
+async def test_create_product_without_header_leaves_owner_email_null(client):
+    response = await client.post(
+        "/products",
+        json={"name": "Unowned", "daraz_url": "https://www.daraz.pk/products/unowned-i1-s1.html"},
+    )
+    assert response.status_code == 201
+    assert response.json()["owner_email"] is None
+
+
+@pytest.mark.asyncio
+async def test_list_products_filters_by_owner_email_but_keeps_unowned_visible(client):
+    await client.post(
+        "/products",
+        json={"name": "Alice's", "daraz_url": "https://www.daraz.pk/products/a-i1-s1.html"},
+        headers={"X-Owner-Email": "alice@example.com"},
+    )
+    await client.post(
+        "/products",
+        json={"name": "Bob's", "daraz_url": "https://www.daraz.pk/products/b-i1-s1.html"},
+        headers={"X-Owner-Email": "bob@example.com"},
+    )
+    await client.post(
+        "/products",
+        json={"name": "Nobody's", "daraz_url": "https://www.daraz.pk/products/c-i1-s1.html"},
+    )
+
+    no_header = await client.get("/products")
+    assert {p["name"] for p in no_header.json()} == {"Alice's", "Bob's", "Nobody's"}
+
+    alice_view = await client.get("/products", headers={"X-Owner-Email": "alice@example.com"})
+    # Alice sees her own product and the unowned one, not Bob's.
+    assert {p["name"] for p in alice_view.json()} == {"Alice's", "Nobody's"}
+
+
+@pytest.mark.asyncio
+async def test_owned_product_endpoint_404s_for_a_different_owner(client):
+    create = await client.post(
+        "/products",
+        json={"name": "Alice's", "daraz_url": "https://www.daraz.pk/products/d-i1-s1.html"},
+        headers={"X-Owner-Email": "alice@example.com"},
+    )
+    product_id = create.json()["id"]
+
+    as_owner = await client.get(
+        f"/products/{product_id}/history", headers={"X-Owner-Email": "alice@example.com"}
+    )
+    assert as_owner.status_code == 200
+
+    as_someone_else = await client.get(
+        f"/products/{product_id}/history", headers={"X-Owner-Email": "bob@example.com"}
+    )
+    assert as_someone_else.status_code == 404
+
+    no_header = await client.get(f"/products/{product_id}/history")
+    assert no_header.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_create_alert_rule_sets_owner_email_and_list_filters_by_it(client):
+    create = await client.post(
+        "/products",
+        json={"name": "P", "daraz_url": "https://www.daraz.pk/products/e-i1-s1.html"},
+        headers={"X-Owner-Email": "alice@example.com"},
+    )
+    product_id = create.json()["id"]
+
+    rule = await client.post(
+        f"/products/{product_id}/alert-rules",
+        json={
+            "rule_type": "price_below",
+            "threshold_price": "1000",
+            "channel": "email",
+            "destination": "alice@example.com",
+        },
+        headers={"X-Owner-Email": "alice@example.com"},
+    )
+    assert rule.status_code == 201
+    assert rule.json()["owner_email"] == "alice@example.com"
+
+    as_someone_else = await client.post(
+        f"/products/{product_id}/alert-rules",
+        json={
+            "rule_type": "price_below",
+            "threshold_price": "1000",
+            "channel": "email",
+            "destination": "bob@example.com",
+        },
+        headers={"X-Owner-Email": "bob@example.com"},
+    )
+    assert as_someone_else.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_list_alerts_filters_by_owner_email(client, db_session):
+    mine = Product(name="Mine", daraz_url="https://www.daraz.pk/mine-i1-s1.html")
+    others = Product(name="Others", daraz_url="https://www.daraz.pk/others-i1-s1.html")
+    db_session.add_all([mine, others])
+    await db_session.commit()
+    await db_session.refresh(mine)
+    await db_session.refresh(others)
+
+    my_rule = AlertRule(
+        product_id=mine.id, rule_type="undercut", channel="email",
+        destination="alice@example.com", owner_email="alice@example.com",
+    )
+    others_rule = AlertRule(
+        product_id=others.id, rule_type="undercut", channel="email",
+        destination="bob@example.com", owner_email="bob@example.com",
+    )
+    db_session.add_all([my_rule, others_rule])
+    await db_session.commit()
+    await db_session.refresh(my_rule)
+    await db_session.refresh(others_rule)
+
+    db_session.add_all(
+        [
+            AlertEvent(alert_rule_id=my_rule.id, resolved_at=None, message="mine"),
+            AlertEvent(alert_rule_id=others_rule.id, resolved_at=None, message="others"),
+        ]
+    )
+    await db_session.commit()
+
+    alice_view = await client.get("/alerts", headers={"X-Owner-Email": "alice@example.com"})
+    assert [e["message"] for e in alice_view.json()] == ["mine"]
+
+    no_header = await client.get("/alerts")
+    assert {e["message"] for e in no_header.json()} == {"mine", "others"}
+
+
+# ---- test-webhook ----
+
+
+@pytest.mark.asyncio
+async def test_test_webhook_sends_and_reports_success(client, monkeypatch):
+    calls = []
+
+    async def fake_send_webhook(destination, body, payload):
+        calls.append((destination, body, payload))
+
+    monkeypatch.setattr("shared.notifiers._send_webhook", fake_send_webhook)
+
+    response = await client.post(
+        "/alerts/test-webhook", json={"webhook_url": "https://discord.com/api/webhooks/1/abc"}
+    )
+    assert response.status_code == 200
+    assert response.json() == {"sent": True}
+    assert len(calls) == 1
+    assert calls[0][0] == "https://discord.com/api/webhooks/1/abc"
+
+
+@pytest.mark.asyncio
+async def test_test_webhook_rejects_non_http_url(client):
+    response = await client.post("/alerts/test-webhook", json={"webhook_url": "not-a-url"})
+    assert response.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_test_webhook_reports_delivery_failure(client, monkeypatch):
+    # Raises NotifyError directly (not a generic Exception) so
+    # send_notification's `except NotifyError: raise` fast path applies —
+    # a generic Exception would instead go through 3 real, slow
+    # full-jitter-backoff retries before giving up (shared/notifiers.py's
+    # NOTIFY_MAX_ATTEMPTS), which is what this test is deliberately
+    # avoiding, not what it's testing.
+    from shared.notifiers import NotifyError
+
+    async def failing_send_webhook(destination, body, payload):
+        raise NotifyError("connection refused")
+
+    monkeypatch.setattr("shared.notifiers._send_webhook", failing_send_webhook)
+
+    response = await client.post(
+        "/alerts/test-webhook", json={"webhook_url": "https://example.com/hook"}
+    )
+    assert response.status_code == 502
+
+
+# ---- GET /products?daraz_url= (product-by-url lookup) ----
+
+
+@pytest.mark.asyncio
+async def test_list_products_by_daraz_url_finds_existing_product(client):
+    await client.post(
+        "/products",
+        json={"name": "Findable", "daraz_url": "https://www.daraz.pk/products/f-i1-s1.html"},
+    )
+    response = await client.get(
+        "/products", params={"daraz_url": "https://www.daraz.pk/products/f-i1-s1.html"}
+    )
+    assert response.status_code == 200
+    results = response.json()
+    assert len(results) == 1
+    assert results[0]["name"] == "Findable"
+
+
+@pytest.mark.asyncio
+async def test_list_products_by_daraz_url_returns_empty_for_unknown_url(client):
+    response = await client.get(
+        "/products", params={"daraz_url": "https://www.daraz.pk/products/nope-i1-s1.html"}
+    )
+    assert response.status_code == 200
+    assert response.json() == []
+
+
+@pytest.mark.asyncio
+async def test_list_products_by_daraz_url_ignores_owner_filter(client):
+    await client.post(
+        "/products",
+        json={"name": "Bob's", "daraz_url": "https://www.daraz.pk/products/g-i1-s1.html"},
+        headers={"X-Owner-Email": "bob@example.com"},
+    )
+    # Alice looking up Bob's product by URL should still find it — this
+    # is an existence check for the "link a competitor" flow, not a
+    # listing operation, so it isn't owner-filtered.
+    response = await client.get(
+        "/products",
+        params={"daraz_url": "https://www.daraz.pk/products/g-i1-s1.html"},
+        headers={"X-Owner-Email": "alice@example.com"},
+    )
+    assert len(response.json()) == 1
+
+
+@pytest.mark.asyncio
+async def test_list_products_by_daraz_url_malformed_url_returns_empty(client):
+    response = await client.get("/products", params={"daraz_url": "not-a-url-at-all"})
+    assert response.status_code == 200
+    assert response.json() == []

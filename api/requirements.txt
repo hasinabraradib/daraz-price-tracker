@@ -7,3 +7,7 @@ pydantic-settings==2.7.1
 alembic==1.14.0
 redis==5.2.1
 prometheus-client==0.21.1
+# Needed at import time by shared/notifiers.py, which api/app/routers/alerts.py
+# now imports for POST /alerts/test-webhook — same versions as worker/requirements.txt.
+aiosmtplib==3.0.2
+httpx==0.28.1

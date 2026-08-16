@@ -1,4 +1,7 @@
+import os
+
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import text
 
 from app.routers import (
@@ -14,6 +17,21 @@ from app.routers import (
 from shared.database import engine
 
 app = FastAPI(title="Daraz Price Tracker")
+
+# The web/ frontend runs on a different origin (Next.js dev server on
+# :3000 by default) than this API (:8000), so the browser needs an
+# explicit CORS allow before it'll let fetch() calls through.
+# FRONTEND_ORIGIN is an env var rather than hardcoded so this doesn't
+# silently break for anyone running the frontend on a different port/host
+# (see web/README.md's NEXT_PUBLIC_API_URL for the other half of this
+# pairing). X-Owner-Email is listed explicitly — it's a custom header, not
+# one of the handful CORS treats as "simple" and allows by default.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[os.environ.get("FRONTEND_ORIGIN", "http://localhost:3000")],
+    allow_methods=["*"],
+    allow_headers=["Content-Type", "X-Owner-Email"],
+)
 
 app.include_router(products.router)
 app.include_router(queue.router)

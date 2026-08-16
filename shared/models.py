@@ -28,6 +28,15 @@ class Product(Base):
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    # "Option B" ownership — see api/app/deps.py's get_owner_email docstring.
+    # Nullable and unvalidated: this is a free-text label read straight off
+    # an X-Owner-Email request header, not tied to any authenticated
+    # identity. It exists so a demo/frontend user only sees their own
+    # products, not to restrict who can see or do what — anyone can type
+    # any email and see/act on whatever's under it. NULL means "created
+    # before this column existed, or created with no header" and is never
+    # filtered out implicitly.
+    owner_email: Mapped[str | None] = mapped_column(String(320), nullable=True)
 
     price_snapshots: Mapped[list["PriceSnapshot"]] = relationship(
         back_populates="product", cascade="all, delete-orphan"
@@ -144,6 +153,11 @@ class AlertRule(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
+    # Same "Option B" ownership as Product.owner_email — see there, and
+    # api/app/deps.py. Denormalized onto AlertRule too (rather than only
+    # on Product, joining through product_id every time) so filtering
+    # "my alert rules"/"my alert events" is a plain WHERE, no join needed.
+    owner_email: Mapped[str | None] = mapped_column(String(320), nullable=True)
 
 
 class AlertEvent(Base):

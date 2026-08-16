@@ -5,6 +5,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.deps import get_owned_product_or_404
 from app.schemas import (
     ComparisonEntry,
     ComparisonResponse,
@@ -19,6 +20,12 @@ router = APIRouter(prefix="/products", tags=["competitors"])
 
 
 async def _get_product_or_404(db: AsyncSession, product_id: int) -> Product:
+    # Deliberately not owner-checked, unlike get_owned_product_or_404 —
+    # this is used for the *competitor* side of a link (payload.competitor_product_id),
+    # and linking someone else's tracked product as your competitor for
+    # comparison purposes is intended, not a leak: it only exposes the
+    # competitor's price/name, which the /comparison and /competitors
+    # responses already surface by design.
     product = await db.get(Product, product_id)
     if product is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="product not found")
@@ -46,9 +53,11 @@ async def _latest_snapshots_by_product(
     status_code=status.HTTP_201_CREATED,
 )
 async def add_competitor(
-    product_id: int, payload: CompetitorLinkCreate, db: AsyncSession = Depends(get_db)
+    product_id: int,
+    payload: CompetitorLinkCreate,
+    db: AsyncSession = Depends(get_db),
+    _owned: Product = Depends(get_owned_product_or_404),
 ):
-    await _get_product_or_404(db, product_id)
     if payload.competitor_product_id == product_id:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -72,9 +81,11 @@ async def add_competitor(
 
 
 @router.get("/{product_id}/competitors", response_model=list[CompetitorWithPrice])
-async def list_competitors(product_id: int, db: AsyncSession = Depends(get_db)):
-    await _get_product_or_404(db, product_id)
-
+async def list_competitors(
+    product_id: int,
+    db: AsyncSession = Depends(get_db),
+    _owned: Product = Depends(get_owned_product_or_404),
+):
     links = (
         await db.execute(
             select(ProductCompetitor).where(ProductCompetitor.product_id == product_id)
@@ -123,7 +134,10 @@ async def list_competitors(product_id: int, db: AsyncSession = Depends(get_db)):
     "/{product_id}/competitors/{competitor_id}", status_code=status.HTTP_204_NO_CONTENT
 )
 async def remove_competitor(
-    product_id: int, competitor_id: int, db: AsyncSession = Depends(get_db)
+    product_id: int,
+    competitor_id: int,
+    db: AsyncSession = Depends(get_db),
+    _owned: Product = Depends(get_owned_product_or_404),
 ):
     stmt = select(ProductCompetitor).where(
         ProductCompetitor.product_id == product_id,
@@ -139,9 +153,11 @@ async def remove_competitor(
 
 
 @router.get("/{product_id}/comparison", response_model=ComparisonResponse)
-async def comparison(product_id: int, db: AsyncSession = Depends(get_db)):
-    await _get_product_or_404(db, product_id)
-
+async def comparison(
+    product_id: int,
+    db: AsyncSession = Depends(get_db),
+    _owned: Product = Depends(get_owned_product_or_404),
+):
     links = (
         await db.execute(
             select(ProductCompetitor).where(ProductCompetitor.product_id == product_id)

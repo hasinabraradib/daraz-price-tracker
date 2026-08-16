@@ -18,6 +18,9 @@ class ProductRead(BaseModel):
     daraz_url: str
     created_at: datetime
     is_active: bool
+    # Set from the X-Owner-Email request header at creation time, not an
+    # authenticated identity — see api/app/deps.py::get_owner_email.
+    owner_email: str | None = None
 
 
 class PriceSnapshotRead(BaseModel):
@@ -186,6 +189,21 @@ class AlertRuleRead(BaseModel):
     destination: str
     is_active: bool
     created_at: datetime
+    owner_email: str | None = None
+
+
+class TestAlertRequest(BaseModel):
+    webhook_url: str
+
+    @model_validator(mode="after")
+    def _validate(self) -> "TestAlertRequest":
+        if not self.webhook_url.startswith(("http://", "https://")):
+            raise ValueError("webhook_url must be an http(s) URL")
+        return self
+
+
+class TestAlertResponse(BaseModel):
+    sent: bool
 
 
 class AlertEventRead(BaseModel):

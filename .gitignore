@@ -10,3 +10,16 @@ venv/
 coverage.xml
 htmlcov/
 .DS_Store
+
+# Terraform — state files contain resource IDs and can contain sensitive
+# values (e.g. dangling data source lookups); .tfvars holds the real
+# my_ip/ssh_public_key_path values for this specific machine. None of
+# this belongs in git — see terraform/main.tf for why losing local state
+# specifically is a real (billable) problem, not just a git hygiene one.
+# (.terraform.lock.hcl is deliberately NOT ignored — that one's meant to
+# be committed, it pins provider versions for reproducible plans.)
+terraform/.terraform/
+terraform/*.tfstate*
+terraform/*.tfvars
+terraform/kubeconfig*
+terraform/tfplan*
